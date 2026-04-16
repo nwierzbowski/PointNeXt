@@ -1,0 +1,70 @@
+[project]
+name = "pointnext"
+version = "0.1.0"
+description = "PointNeXt: Revisiting PointNet++ with Improved Training and Scaling Strategies"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    # Local C++ extensions
+    "pointnet2-cuda @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/pointnet2_batch",
+    "pointops @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/pointops",
+    "chamfer @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/chamfer_dist",
+    "emd-ext @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/emd",
+    "grid-subsampling @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/subsampling",
+    
+    # Core dependencies
+    "torch>=2.0.0",
+    "torchvision",
+    "torch-scatter",
+    "numpy<2.0",
+    
+    # ML utilities
+    "scikit-learn==1.0.2",
+    "deepspeed",
+    "wandb",
+    "tensorboard==2.8.0",
+    
+    # Data handling
+    "pandas",
+    "gdown",
+    "PyYAML==6.0",
+    "easydict==1.9",
+    "h5py>=3.6.0",
+    
+    # Visualization
+    "matplotlib==3.5.1",
+    "pyvista",
+    
+    # Training utilities
+    "tqdm==4.62.3",
+    "pillow",
+    "protobuf==3.19.4",
+    "multimethod==1.7",
+    "ninja==1.10.2.3",
+    "Cython==0.29.28",
+    "setuptools==59.5.0",
+    
+    # Optional
+    "pickleshare==0.7.5",
+    "termcolor==1.1.0",
+    "shortuuid",
+    
+    # Docs
+    "mkdocs-material",
+    "mkdocs-awesome-pages-plugin",
+    "mdx_truly_sane_lists",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+torch-scatter = { url = "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_scatter-2.1.2%2Bpt24cu121-cp39-cp39-linux_x86_64.whl" }
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "setuptools>=59.5.0",
+]
