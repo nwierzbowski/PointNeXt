@@ -12,7 +12,7 @@ dependencies = [
     "grid-subsampling @ file:///home/nwier/Documents/git/Pivotv1.1/pivot-data/pivot-curator/PointNeXt/openpoints/cpp/subsampling",
     
     # Core dependencies
-    "torch>=2.0.0",
+    "torch==2.4.0+cu121",
     "torchvision",
     "torch-scatter",
     "numpy<2.0",

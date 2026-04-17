@@ -835,10 +835,10 @@ wheels = [
 
 [[package]]
 name = "nvidia-nccl-cu12"
-version = "2.21.5"
+version = "2.20.5"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/99/12cd266d6233f47d00daf3a72739872bdc10267d0383508b0b9c84a18bb6/nvidia_nccl_cu12-2.21.5-py3-none-manylinux2014_x86_64.whl", hash = "sha256:8579076d30a8c24988834445f8d633c697d42397e92ffc3f63fa26766d25e0a0", size = 188654414, upload-time = "2024-04-03T15:32:57.427Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/2a/0a131f572aa09f741c30ccd45a8e56316e8be8dfc7bc19bf0ab7cfef7b19/nvidia_nccl_cu12-2.20.5-py3-none-manylinux2014_x86_64.whl", hash = "sha256:057f6bf9685f75215d0c53bf3ac4a10b3e6578351de307abad9e18a99182af56", size = 176249402, upload-time = "2024-03-06T04:30:20.663Z" },
 ]
 
 [[package]]
@@ -1031,7 +1031,7 @@ requires-dist = [
     { name = "shortuuid" },
     { name = "tensorboard", specifier = "==2.8.0" },
     { name = "termcolor", specifier = "==1.1.0" },
-    { name = "torch", specifier = ">=2.0.0", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "torch", specifier = "==2.4.0+cu121", index = "https://download.pytorch.org/whl/cu121" },
     { name = "torch-scatter", url = "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_scatter-2.1.2%2Bpt24cu121-cp39-cp39-linux_x86_64.whl" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu121" },
     { name = "tqdm", specifier = "==4.62.3" },
@@ -1485,7 +1485,7 @@ wheels = [
 
 [[package]]
 name = "torch"
-version = "2.5.1+cu121"
+version = "2.4.0+cu121"
 source = { registry = "https://download.pytorch.org/whl/cu121" }
 dependencies = [
     { name = "filelock" },
@@ -1508,8 +1508,8 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:3c96b2ec4723e7d97259964ee73e2d6a2bace42511a49005b083ea7be1a0b0ac" },
-    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp39-cp39-win_amd64.whl", hash = "sha256:dc4249c520a6e9b1555e46bd70586a7cf33012800a51acb58a0c51464e3a786a" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.4.0%2Bcu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:88839bae2b967dd38579aab0bba9510e92b11dabbc4e1dd5e630c5fd655f5da7" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.4.0%2Bcu121-cp39-cp39-win_amd64.whl", hash = "sha256:008e0895ec3193e9f547cd6104d835f80dd12e85440bbe3c9f408072376bcd19" },
 ]
 
 [[package]]
@@ -1529,7 +1529,7 @@ provides-extras = ["test"]
 
 [[package]]
 name = "torchvision"
-version = "0.20.1+cu121"
+version = "0.19.0+cu121"
 source = { registry = "https://download.pytorch.org/whl/cu121" }
 dependencies = [
     { name = "numpy" },
@@ -1537,8 +1537,8 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:8a979f15174d79a30fee178fdf0f9e7ca29d639644b6ac3e7bd52b308284f254" },
-    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp39-cp39-win_amd64.whl", hash = "sha256:4aea5f2e7e0f18ba60a15a542ba5bc691ce8af4d7a5c1dd2f252e8c4ff2bef15" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.19.0%2Bcu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:47628647bdb3590c9ab965efb70853300d5e1c68759511ee994a6f1f97f2c123" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.19.0%2Bcu121-cp39-cp39-win_amd64.whl", hash = "sha256:cd4b808181ceb6b0dbb947561fd52cddb3a77567600f9495bec1ab73ec8727cc" },
 ]
 
 [[package]]
@@ -1555,13 +1555,13 @@ wheels = [
 
 [[package]]
 name = "triton"
-version = "3.1.0"
+version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/69/57e0fed438d547524e08bfedc587078314176ad1c15c8be904d3f03149ec/triton-3.1.0-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:aafa9a20cd0d9fee523cd4504aa7131807a864cd77dcf6efe7e981f18b8c6c11", size = 209460480, upload-time = "2024-10-14T16:06:13.116Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/bf/55cccf57c14787ad81ee827526ddd48fd0aff0291fcc7b8c2e2bdf28da0a/triton-3.0.0-1-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:6e5727202f7078c56f91ff13ad0c1abab14a0e7f2c87e91b12b6f64f3e8ae609", size = 209377082, upload-time = "2024-07-19T20:57:41.314Z" },
 ]
 
 [[package]]
