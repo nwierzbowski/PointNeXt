@@ -32,6 +32,7 @@ def train_mae_from_data(
     num_points=1024,
     warmup_epochs=0,
     resume_from=None,
+    stop_callback=None,
     device=None,
     log_callback=None,
     epoch_callback=None,
@@ -54,6 +55,7 @@ def train_mae_from_data(
         num_points: number of points per sample
         warmup_epochs: number of warmup epochs
         resume_from: path to checkpoint to resume from
+        stop_callback: callable() -> bool, returns True if training should stop
         device: torch device ('cuda' or 'cpu')
         log_callback: callable(str) for progress logging
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
@@ -153,6 +155,7 @@ def train_mae_from_data(
         checkpoint_dir,
         log_callback,
         start_epoch,
+        stop_callback,
         epoch_callback,
     )
 
@@ -169,6 +172,7 @@ def train_mae(
     checkpoint_dir,
     log_callback=None,
     start_epoch=0,
+    stop_callback=None,
     epoch_callback=None,
 ):
     """Train a PointNextMAE model.
@@ -186,6 +190,7 @@ def train_mae(
         checkpoint_dir: directory to save checkpoints
         log_callback: callable(str) for progress logging
         start_epoch: epoch to start from (0 = fresh training)
+        stop_callback: callable() -> bool, returns True if training should stop
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
 
     Returns:
@@ -193,6 +198,7 @@ def train_mae(
     """
     model.train()
     best_loss = float('inf')
+    stopped = False
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         total_loss = 0.0
@@ -204,11 +210,20 @@ def train_mae(
             optimizer.zero_grad()
             loss, pred, latent = model(data)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
             num_batches += 1
+
+            if stop_callback and stop_callback():
+                if log_callback:
+                    log_callback('Training stopped by user')
+                stopped = True
+                break
+
+        if stopped:
+            break
 
         scheduler.step()
         avg_loss = total_loss / max(num_batches, 1)
@@ -225,14 +240,11 @@ def train_mae(
                 model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
             )
 
-        if epoch % 50 == 0:
+        if epoch % 5 == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch}.pth')
             _save_checkpoint(
                 model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
             )
-
-    final_ckpt = os.path.join(checkpoint_dir, 'final.pth')
-    _save_checkpoint(model, optimizer, num_epochs, best_loss, final_ckpt, scheduler)
 
     return best_loss
 
