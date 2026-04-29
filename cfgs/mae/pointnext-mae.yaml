@@ -51,3 +51,4 @@ training:
   epochs: 50
   lr: 0.001
   num_points: 1024
+  warmup_epochs: 0

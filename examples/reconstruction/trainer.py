@@ -31,8 +31,10 @@ def train_mae_from_data(
     in_channels=6,
     num_points=1024,
     warmup_epochs=0,
+    resume_from=None,
     device=None,
     log_callback=None,
+    epoch_callback=None,
 ):
     """Train a PointNextMAE model from raw data.
 
@@ -50,8 +52,11 @@ def train_mae_from_data(
         lr: learning rate
         in_channels: number of input channels (3 + features)
         num_points: number of points per sample
+        warmup_epochs: number of warmup epochs
+        resume_from: path to checkpoint to resume from
         device: torch device ('cuda' or 'cpu')
         log_callback: callable(str) for progress logging
+        epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
 
     Returns:
         best_loss: float, the best training loss achieved
@@ -81,13 +86,43 @@ def train_mae_from_data(
         total_params = sum(p.numel() for p in model.parameters())
         log_callback(f'Model parameters: {total_params / 1e6:.2f}M')
 
-    # Optimizer and scheduler
+    # Optimizer and scheduler (must be created before loading checkpoint)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
         weight_decay=0.05,
     )
-    if warmup_epochs > 0:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=1e-5,
+    )
+
+    # Resume from checkpoint if provided (after optimizer/scheduler are created)
+    start_epoch = 0
+    if resume_from and os.path.exists(resume_from):
+        try:
+            checkpoint = torch.load(resume_from, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except Exception:
+                    pass
+            if log_callback:
+                log_callback(f'Loaded checkpoint: {resume_from} (epoch {start_epoch})')
+        except Exception as e:
+            if log_callback:
+                log_callback(f'Warning: Could not load checkpoint: {e}')
+            start_epoch = 0
+    elif resume_from:
+        if log_callback:
+            log_callback(f'Warning: Checkpoint not found: {resume_from}')
+
+    # Apply warmup if fresh training
+    if start_epoch == 0 and warmup_epochs > 0:
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[
@@ -100,16 +135,13 @@ def train_mae_from_data(
             ],
             milestones=[warmup_epochs],
         )
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=num_epochs,
-            eta_min=1e-5,
-        )
 
     # Training loop
     if log_callback:
-        log_callback(f'Starting training: {num_epochs} epochs')
+        if start_epoch > 0:
+            log_callback(f'Resuming training from epoch {start_epoch}')
+        else:
+            log_callback(f'Starting training: {num_epochs} epochs')
 
     best_loss = train_mae(
         model,
@@ -120,6 +152,8 @@ def train_mae_from_data(
         num_epochs,
         checkpoint_dir,
         log_callback,
+        start_epoch,
+        epoch_callback,
     )
 
     return best_loss
@@ -134,6 +168,8 @@ def train_mae(
     num_epochs,
     checkpoint_dir,
     log_callback=None,
+    start_epoch=0,
+    epoch_callback=None,
 ):
     """Train a PointNextMAE model.
 
@@ -149,6 +185,8 @@ def train_mae(
         num_epochs: number of epochs
         checkpoint_dir: directory to save checkpoints
         log_callback: callable(str) for progress logging
+        start_epoch: epoch to start from (0 = fresh training)
+        epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
 
     Returns:
         best_loss: float
@@ -156,7 +194,7 @@ def train_mae(
     model.train()
     best_loss = float('inf')
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch + 1, num_epochs + 1):
         total_loss = 0.0
         num_batches = 0
 
@@ -177,22 +215,24 @@ def train_mae(
 
         if log_callback:
             log_callback(f'Epoch {epoch}/{num_epochs} - Loss: {avg_loss:.4f}')
+        if epoch_callback:
+            epoch_callback(epoch, num_epochs, avg_loss)
 
         if avg_loss < best_loss:
             best_loss = avg_loss
             ckpt_path = os.path.join(checkpoint_dir, 'best.pth')
             _save_checkpoint(
-                model, optimizer, epoch, avg_loss, ckpt_path,
+                model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
             )
 
         if epoch % 50 == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch}.pth')
             _save_checkpoint(
-                model, optimizer, epoch, avg_loss, ckpt_path,
+                model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
             )
 
     final_ckpt = os.path.join(checkpoint_dir, 'final.pth')
-    _save_checkpoint(model, optimizer, num_epochs, best_loss, final_ckpt)
+    _save_checkpoint(model, optimizer, num_epochs, best_loss, final_ckpt, scheduler)
 
     return best_loss
 
@@ -274,14 +314,14 @@ class _TBOMemoryDataset(torch.utils.data.Dataset):
         return pos
 
 
-def _save_checkpoint(model, optimizer, epoch, loss, path):
+def _save_checkpoint(model, optimizer, epoch, loss, path, scheduler=None):
     """Save model checkpoint."""
-    torch.save(
-        {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss,
-        },
-        path,
-    )
+    state = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }
+    if scheduler is not None:
+        state['scheduler_state_dict'] = scheduler.state_dict()
+    torch.save(state, path)
