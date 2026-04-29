@@ -30,6 +30,7 @@ def train_mae_from_data(
     lr=0.001,
     in_channels=6,
     num_points=1024,
+    warmup_epochs=0,
     device=None,
     log_callback=None,
 ):
@@ -86,11 +87,25 @@ def train_mae_from_data(
         lr=lr,
         weight_decay=0.05,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs,
-        eta_min=1e-5,
-    )
+    if warmup_epochs > 0:
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-5
+                ),
+            ],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=num_epochs,
+            eta_min=1e-5,
+        )
 
     # Training loop
     if log_callback:
@@ -183,61 +198,19 @@ def train_mae(
 
 
 def _build_model(config_path, in_channels):
-    """Build a PointNextMAE model from config, with hardcoded fallback."""
-    try:
-        from openpoints.models import build_model_from_cfg
-        from openpoints.utils import EasyConfig
+    """Build a PointNextMAE model from YAML config."""
+    from openpoints.models import build_model_from_cfg
+    from openpoints.utils import EasyConfig
 
-        cfg = EasyConfig()
-        cfg.load(config_path, recursive=True)
+    cfg = EasyConfig()
+    cfg.load(config_path, recursive=False)
 
-        # Override in_channels
-        if hasattr(cfg, 'model') and hasattr(cfg.model, 'encoder_args'):
-            cfg.model.encoder_args.in_channels = in_channels
+    # Override in_channels from UI
+    if hasattr(cfg, 'model') and hasattr(cfg.model, 'encoder_args'):
+        cfg.model.encoder_args.in_channels = in_channels
 
-        model = build_model_from_cfg(cfg.model)
-        return model
-    except Exception:
-        # Fallback: build model directly with hardcoded config
-        from openpoints.models.reconstruction.pointnext_mae import PointNextMAE
-        from openpoints.utils.config import EasyConfig
-
-        encoder_args = {
-            'NAME': 'PointNextEncoder',
-            'blocks': [1, 1, 1, 1, 1, 1],
-            'strides': [1, 2, 2, 2, 2, 1],
-            'width': 32,
-            'in_channels': in_channels,
-            'sa_layers': 2,
-            'sa_use_res': True,
-            'radius': 0.15,
-            'radius_scaling': 1.5,
-            'nsample': 32,
-            'expansion': 4,
-            'aggr_args': {
-                'feature_type': 'dp_fj',
-                'reduction': 'max',
-            },
-            'group_args': {
-                'NAME': 'ballquery',
-                'normalize_dp': True,
-            },
-            'conv_args': {'order': 'conv-norm-act'},
-            'act_args': {'act': 'relu'},
-            'norm_args': {'norm': 'bn'},
-        }
-
-        encoder_cfg = EasyConfig()
-        encoder_cfg.update(encoder_args)
-
-        return PointNextMAE(
-            encoder_args=encoder_cfg,
-            latent_dim=256,
-            decoder_points=1024,
-            decoder_hidden_dim=512,
-            jitter_sigma=0.01,
-            jitter_prob=0.9,
-        )
+    model = build_model_from_cfg(cfg.model)
+    return model
 
 
 class _TBOMemoryDataset(torch.utils.data.Dataset):

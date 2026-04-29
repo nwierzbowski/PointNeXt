@@ -1,39 +1,53 @@
-# PointNeXt-S Encoder-Decoder config
-# Full point cloud -> PointNeXt encoder -> 256d latent -> decoder -> reconstructed cloud
-# Loss: Chamfer Distance L1
-
 model:
   NAME: PointNextMAE
+  decoder_hidden_dim: 512
+  decoder_points: 1024
   encoder_args:
     NAME: PointNextEncoder
-    blocks: [1, 1, 1, 1, 1, 1]
-    strides: [1, 2, 2, 2, 2, 1]
-    width: 32
-    in_channels: 6
-    sa_layers: 2
-    sa_use_res: True
-    radius: 0.15
-    radius_scaling: 1.5
-    nsample: 32
-    expansion: 4
+    act_args:
+      act: relu
     aggr_args:
-      feature_type: 'dp_fj'
-      reduction: 'max'
-    group_args:
-      NAME: 'ballquery'
-      normalize_dp: True
+      feature_type: dp_fj
+      reduction: max
+    blocks:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
     conv_args:
       order: conv-norm-act
-    act_args:
-      act: 'relu'
+    expansion: 4
+    group_args:
+      NAME: ballquery
+      normalize_dp: true
+    in_channels: 4
     norm_args:
-      norm: 'bn'
-  latent_dim: 256
-  decoder_points: 1024
-  decoder_hidden_dim: 512
-  jitter_sigma: 0.01
+      norm: bn
+    nsample: 32
+    radius: 0.15
+    radius_scaling: 1.5
+    sa_layers: 2
+    sa_use_res: true
+    strides:
+    - 1
+    - 2
+    - 2
+    - 2
+    - 2
+    - 1
+    width: 32
   jitter_prob: 0.9
-
-epochs: 300
-lr: 0.001
-batch_size: 32
+  jitter_sigma: 0.01
+  latent_dim: 256
+training:
+  batch_size: 256
+  channels:
+    combined: true
+    normal: false
+    surface: false
+  device: cuda
+  epochs: 50
+  lr: 0.001
+  num_points: 1024
