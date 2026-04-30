@@ -63,9 +63,7 @@ def train_mae_from_data(
     Returns:
         best_loss: float, the best training loss achieved
     """
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
+    device = _get_device(device)
 
     # Build dataset and dataloader
     dataset = _TBOMemoryDataset(positions, features, uuids, num_points, in_channels)
@@ -107,26 +105,14 @@ def train_mae_from_data(
 
     # Resume from checkpoint if provided (after optimizer/scheduler are created)
     start_epoch = 0
-    if resume_from and os.path.exists(resume_from):
-        try:
-            checkpoint = torch.load(resume_from, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
-            if 'scheduler_state_dict' in checkpoint:
-                try:
-                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                except Exception:
-                    pass
+    if resume_from:
+        if os.path.exists(resume_from):
+            start_epoch = _load_training_checkpoint(resume_from, model, optimizer, scheduler, device)
             if log_callback:
                 log_callback(f'Loaded checkpoint: {resume_from} (epoch {start_epoch})')
-        except Exception as e:
+        else:
             if log_callback:
-                log_callback(f'Warning: Could not load checkpoint: {e}')
-            start_epoch = 0
-    elif resume_from:
-        if log_callback:
-            log_callback(f'Warning: Checkpoint not found: {resume_from}')
+                log_callback(f'Warning: Checkpoint not found: {resume_from}')
 
     # Apply warmup if fresh training
     if start_epoch == 0 and warmup_epochs > 0:
@@ -158,6 +144,7 @@ def train_mae_from_data(
         device,
         num_epochs,
         checkpoint_dir,
+        in_channels,
         log_callback,
         start_epoch,
         stop_callback,
@@ -176,6 +163,7 @@ def train_mae(
     device,
     num_epochs,
     checkpoint_dir,
+    in_channels=6,
     log_callback=None,
     start_epoch=0,
     stop_callback=None,
@@ -214,7 +202,7 @@ def train_mae(
         num_batches = 0
 
         for batch in train_loader:
-            data = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            data = {k: v.to(device, non_blocking=True) for k, v in batch.items() if k != 'uuids'}
 
             optimizer.zero_grad()
 
@@ -223,6 +211,7 @@ def train_mae(
 
             if use_amp:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
             else:
                 loss.backward()
 
@@ -258,28 +247,140 @@ def train_mae(
             best_loss = avg_loss
             ckpt_path = os.path.join(checkpoint_dir, 'best.pth')
             _save_checkpoint(
-                model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
+                model, optimizer, epoch, avg_loss, ckpt_path, scheduler, in_channels,
             )
 
         if epoch % 5 == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch}.pth')
             _save_checkpoint(
-                model, optimizer, epoch, avg_loss, ckpt_path, scheduler,
+                model, optimizer, epoch, avg_loss, ckpt_path, scheduler, in_channels,
             )
 
     return best_loss
 
 
-def _build_model(config_path, in_channels):
-    """Build a PointNextMAE model from YAML config."""
+def _get_device(device):
+    """Auto-detect device and wrap in torch.device.
+
+    Args:
+        device: 'cuda', 'cpu', None, or torch.device.
+
+    Returns:
+        torch.device
+    """
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return torch.device(device)
+
+
+def _read_checkpoint_in_channels(checkpoint_path):
+    """Read in_channels from checkpoint metadata without loading the model.
+
+    Args:
+        checkpoint_path: Path to checkpoint file.
+
+    Returns:
+        int or None if not found.
+    """
+    try:
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        for key in ['model', 'net', 'network', 'state_dict', 'base_model']:
+            if key in state_dict:
+                state_dict = state_dict[key]
+        return state_dict.get('in_channels', None)
+    except Exception:
+        return None
+
+
+def _clean_data(pos, feat):
+    """Replace NaN/Inf values with zeros.
+
+    Args:
+        pos: (N, 3) numpy array.
+        feat: (N, C) numpy array.
+
+    Returns:
+        Tuple of (cleaned_pos, cleaned_feat) as numpy arrays.
+    """
+    pos_mask = np.isnan(pos) | np.isinf(pos)
+    if pos_mask.any():
+        pos = np.where(pos_mask, 0.0, pos)
+    feat_mask = np.isnan(feat) | np.isinf(feat)
+    if feat_mask.any():
+        feat = np.where(feat_mask, 0.0, feat)
+    return pos, feat
+
+
+def _build_x_numpy(pos, feat, in_channels):
+    """Build input features tensor from numpy arrays.
+
+    Pads or truncates feature channels to match in_channels, then
+    concatenates with positions.
+
+    Args:
+        pos: (N, 3) numpy array of positions.
+        feat: (N, C) numpy array of features.
+        in_channels: Total input channels (3 + features).
+
+    Returns:
+        torch.Tensor of shape (N, in_channels).
+    """
+    if in_channels > 3:
+        needed = in_channels - 3
+        if feat.shape[1] < needed:
+            pad = np.zeros((feat.shape[0], needed - feat.shape[1]), dtype=np.float32)
+            feat = np.concatenate([feat, pad], axis=1)
+        feat = feat[:, :needed]
+        return torch.from_numpy(np.concatenate([pos, feat], axis=1)).float()
+    return torch.from_numpy(pos).float()
+
+
+def _build_x_tensor(pos, feat, in_channels):
+    """Build input features tensor from torch tensors.
+
+    Pads or truncates feature channels to match in_channels, then
+    concatenates with positions.
+
+    Args:
+        pos: (N, 3) torch tensor.
+        feat: (N, C) torch tensor.
+        in_channels: Total input channels (3 + features).
+
+    Returns:
+        torch.Tensor of shape (N, in_channels).
+    """
+    if in_channels > 3:
+        needed = in_channels - 3
+        if feat.shape[1] < needed:
+            pad = torch.zeros(
+                feat.shape[0], needed - feat.shape[1],
+                dtype=torch.float32, device=feat.device,
+            )
+            feat = torch.cat([feat, pad], dim=1)
+        feat = feat[:, :needed]
+        return torch.cat([pos, feat], dim=1)
+    return pos
+
+
+def _build_model(config_path, in_channels=None):
+    """Build a PointNextMAE model from YAML config.
+
+    Args:
+        config_path: Path to YAML config file.
+        in_channels: Number of input channels. If None, uses config value.
+                    If provided, overrides config value.
+
+    Returns:
+        PointNextMAE model instance.
+    """
     from openpoints.models import build_model_from_cfg
     from openpoints.utils import EasyConfig
 
     cfg = EasyConfig()
     cfg.load(config_path, recursive=False)
 
-    # Override in_channels from UI
-    if hasattr(cfg, 'model') and hasattr(cfg.model, 'encoder_args'):
+    # Override in_channels if provided (from checkpoint metadata)
+    if in_channels is not None and hasattr(cfg, 'model') and hasattr(cfg.model, 'encoder_args'):
         cfg.model.encoder_args.in_channels = in_channels
 
     model = build_model_from_cfg(cfg.model)
@@ -310,13 +411,8 @@ class _TBOMemoryDataset(torch.utils.data.Dataset):
         pos = self.positions[idx].astype('float32')
         feat = self.features[idx].astype('float32')
 
-        # Check for NaN/Inf in raw data — replace with zeros
-        pos_mask = np.isnan(pos) | np.isinf(pos)
-        if pos_mask.any():
-            pos = np.where(pos_mask, 0.0, pos)
-        feat_mask = np.isnan(feat) | np.isinf(feat)
-        if feat_mask.any():
-            feat = np.where(feat_mask, 0.0, feat)
+        # Clean NaN/Inf in raw data
+        pos, feat = _clean_data(pos, feat)
 
         n = len(pos)
         if n != self.num_points:
@@ -330,31 +426,223 @@ class _TBOMemoryDataset(torch.utils.data.Dataset):
 
         return {
             'pos': pos,
-            'x': self._build_x(pos, feat),
+            'x': _build_x_tensor(pos, feat, self.in_channels),
+            'uuids': self.uuids[idx],
         }
 
-    def _build_x(self, pos, feat):
-        """Build input features tensor."""
-        if self.in_channels > 3:
-            needed = self.in_channels - 3
-            if feat.shape[1] < needed:
-                pad = torch.zeros(
-                    feat.shape[0], needed - feat.shape[1],
-                    dtype=torch.float32, device=feat.device,
-                )
-                feat = torch.cat([feat, pad], dim=1)
-            return torch.cat([pos, feat[:, :needed]], dim=1)
-        return pos
 
-
-def _save_checkpoint(model, optimizer, epoch, loss, path, scheduler=None):
+def _save_checkpoint(model, optimizer, epoch, loss, path, scheduler=None, in_channels=None):
     """Save model checkpoint."""
     state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
+        'in_channels': in_channels,
     }
     if scheduler is not None:
         state['scheduler_state_dict'] = scheduler.state_dict()
     torch.save(state, path)
+
+
+def _load_checkpoint(model, checkpoint_path):
+    """Load trained weights into model with strict matching.
+
+    Handles different checkpoint formats (nested under 'model', 'net', etc.)
+    and removes 'module.' prefix from DDP-saved weights.
+
+    Raises:
+        RuntimeError: If checkpoint architecture doesn't match model (strict mode).
+
+    Args:
+        model: PointNextMAE model instance.
+        checkpoint_path: Path to checkpoint file.
+
+    Returns:
+        Tuple of (None, in_channels) where in_channels is the value stored in checkpoint.
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
+
+    state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+    # Handle different checkpoint formats
+    ckpt_state_dict = state_dict
+    for key in ['model', 'net', 'network', 'state_dict', 'base_model', 'model_state_dict']:
+        if key in state_dict:
+            ckpt_state_dict = state_dict[key]
+
+    # Read in_channels from checkpoint metadata
+    in_channels = ckpt_state_dict.get('in_channels', None)
+
+    base_ckpt = {k.replace('module.', ''): v for k, v in ckpt_state_dict.items()}
+    model.load_state_dict(base_ckpt, strict=True)
+    return None, in_channels
+
+
+def _load_training_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
+    """Load checkpoint for training resume.
+
+    Uses _load_checkpoint for model weights (with format/DDP handling),
+    then loads optimizer, scheduler, and epoch metadata.
+
+    Args:
+        checkpoint_path: Path to checkpoint file.
+        model: PointNextMAE model instance.
+        optimizer: torch optimizer.
+        scheduler: LR scheduler.
+        device: torch device.
+
+    Returns:
+        start_epoch: int, epoch to resume from (0 if fresh training).
+    """
+    # Load model weights with full format/DDP handling
+    _, _ = _load_checkpoint(model, checkpoint_path)
+
+    # Load optimizer/scheduler/epoch from checkpoint
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    for key in ['model', 'net', 'network', 'state_dict', 'base_model', 'model_state_dict']:
+        if key in state_dict:
+            state_dict = state_dict[key]
+
+    start_epoch = state_dict.get('epoch', 0)
+    if 'optimizer_state_dict' in state_dict:
+        optimizer.load_state_dict(state_dict['optimizer_state_dict'])
+    if 'scheduler_state_dict' in state_dict:
+        try:
+            scheduler.load_state_dict(state_dict['scheduler_state_dict'])
+        except Exception:
+            pass
+
+    return start_epoch
+
+
+def _batch_save(uuids, embeddings_np, save_callback):
+    """Pass batch through to callback — callback handles iteration.
+
+    Args:
+        uuids: List of mesh hash strings.
+        embeddings_np: (batch_size, dim) numpy array.
+        save_callback: callable(uuids, embeddings_np).
+    """
+    save_callback(uuids, embeddings_np)
+
+
+def _preprocess_sample(pos, feat, in_channels):
+    """Preprocess a single sample: NaN/Inf handling + feature tensor building.
+
+    Args:
+        pos: (N, 3) numpy array of positions.
+        feat: (N, C) numpy array of features.
+        in_channels: Total input channels (3 + features).
+
+    Returns:
+        torch.Tensor of shape (N, in_channels) with positions + features.
+    """
+    pos, feat = _clean_data(pos, feat)
+    return _build_x_numpy(pos, feat, in_channels)
+
+
+def extract_latent_from_data(
+    positions,
+    features,
+    uuids,
+    config_path,
+    checkpoint_path,
+    num_points=1024,
+    batch_size=128,
+    device=None,
+    stop_callback=None,
+    log_callback=None,
+    progress_callback=None,
+    save_callback=None,
+):
+    """Extract embeddings from raw point cloud data.
+
+    High-level entry point that handles model loading, batch processing
+    via DataLoader, and embedding extraction.
+
+    Args:
+        positions: list of numpy arrays (N, 3)
+        features: list of numpy arrays (N, C)
+        uuids: list of string identifiers (mesh hashes)
+        config_path: path to YAML config file
+        checkpoint_path: path to trained checkpoint file
+        num_points: number of points per sample
+        batch_size: batch size for extraction
+        device: torch device ('cuda' or 'cpu'), or None for auto-detect
+        stop_callback: callable() -> bool, returns True if extraction should stop
+        log_callback: callable(str) for progress logging
+        progress_callback: callable(current, total) for batch progress
+        save_callback: callable(uuids, embeddings_np) for batch DB persistence
+
+    Returns:
+        saved_count: int, number of embeddings saved
+    """
+    device = _get_device(device)
+
+    if log_callback:
+        log_callback(f'Loading model from: {checkpoint_path}')
+        log_callback(f'Device: {device}')
+
+    # Read in_channels from checkpoint metadata first
+    ckpt_in_channels = _read_checkpoint_in_channels(checkpoint_path)
+    if ckpt_in_channels is not None:
+        if log_callback:
+            log_callback(f'Checkpoint in_channels: {ckpt_in_channels}')
+    else:
+        if log_callback:
+            log_callback('Warning: Checkpoint has no in_channels metadata')
+
+    # Build model with checkpoint's in_channels
+    if log_callback:
+        log_callback('Building PointNeXt model...')
+    model = _build_model(config_path, ckpt_in_channels)
+
+    # Load checkpoint
+    _, _ = _load_checkpoint(model, checkpoint_path)
+    model = model.to(device)
+    model.eval()
+
+    if log_callback:
+        log_callback(f'Loaded checkpoint: {checkpoint_path}')
+
+    # Build dataset and DataLoader for extraction
+    dataset = _TBOMemoryDataset(positions, features, uuids, num_points, ckpt_in_channels or 6)
+    extract_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=12,
+        pin_memory=True,
+    )
+
+    if log_callback:
+        log_callback(f'Extraction dataset: {len(dataset)} samples')
+
+    # Extract embeddings in batches
+    total = len(positions)
+    saved_count = 0
+
+    with torch.no_grad():
+        for batch in extract_loader:
+            if stop_callback and stop_callback():
+                if log_callback:
+                    log_callback('Embedding extraction cancelled.')
+                return saved_count
+
+            p = batch['pos'].to(device, non_blocking=True)
+            x = batch['x'].to(device, non_blocking=True)
+
+            embeddings = model.get_latent({'pos': p, 'x': x})
+            embeddings_np = embeddings.cpu().numpy()
+
+            _batch_save(batch['uuids'], embeddings_np, save_callback)
+            saved_count += len(batch['uuids'])
+
+            if progress_callback:
+                progress_callback(saved_count, total)
+            if log_callback:
+                log_callback(f'Processed {saved_count}/{total} assets')
+
+    return saved_count
