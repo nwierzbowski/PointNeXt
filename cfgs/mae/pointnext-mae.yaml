@@ -42,13 +42,13 @@ model:
   jitter_sigma: 0.01
   latent_dim: 256
 training:
-  batch_size: 256
+  batch_size: 512
   channels:
     combined: true
     normal: false
     surface: false
   device: cuda
-  epochs: 50
-  lr: 0.001
+  epochs: 210
+  lr: 0.0013
   num_points: 1024
-  warmup_epochs: 0
+  warmup_epochs: 10

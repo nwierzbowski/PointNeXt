@@ -65,6 +65,7 @@ def train_mae_from_data(
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
 
     # Build dataset and dataloader
     dataset = _TBOMemoryDataset(positions, features, uuids, num_points, in_channels)
@@ -99,6 +100,10 @@ def train_mae_from_data(
         T_max=num_epochs,
         eta_min=1e-5,
     )
+
+    # AMP scaler for bfloat16 mixed precision
+    use_amp = device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
     # Resume from checkpoint if provided (after optimizer/scheduler are created)
     start_epoch = 0
@@ -157,6 +162,7 @@ def train_mae_from_data(
         start_epoch,
         stop_callback,
         epoch_callback,
+        scaler,
     )
 
     return best_loss
@@ -174,6 +180,7 @@ def train_mae(
     start_epoch=0,
     stop_callback=None,
     epoch_callback=None,
+    scaler=None,
 ):
     """Train a PointNextMAE model.
 
@@ -192,6 +199,7 @@ def train_mae(
         start_epoch: epoch to start from (0 = fresh training)
         stop_callback: callable() -> bool, returns True if training should stop
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
+        scaler: GradScaler for AMP (None = no AMP)
 
     Returns:
         best_loss: float
@@ -199,6 +207,7 @@ def train_mae(
     model.train()
     best_loss = float('inf')
     stopped = False
+    use_amp = scaler is not None
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         total_loss = 0.0
@@ -208,10 +217,22 @@ def train_mae(
             data = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
             optimizer.zero_grad()
-            loss, pred, latent = model(data)
-            loss.backward()
+
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
+                loss, pred, latent = model(data)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
             total_loss += loss.item()
             num_batches += 1
