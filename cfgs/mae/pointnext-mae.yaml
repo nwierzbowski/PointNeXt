@@ -48,7 +48,8 @@ training:
     normal: false
     surface: false
   device: cuda
-  epochs: 210
+  epochs: 201
   lr: 0.0013
   num_points: 1024
-  warmup_epochs: 10
+  report_interval: 10
+  warmup_epochs: 1

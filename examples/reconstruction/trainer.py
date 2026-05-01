@@ -32,11 +32,13 @@ def train_mae_from_data(
     in_channels=6,
     num_points=1024,
     warmup_epochs=0,
+    report_interval=10,
     resume_from=None,
     stop_callback=None,
     device=None,
     log_callback=None,
     epoch_callback=None,
+    step_callback=None,
 ):
     """Train a PointNextMAE model from raw data.
 
@@ -55,11 +57,13 @@ def train_mae_from_data(
         in_channels: number of input channels (3 + features)
         num_points: number of points per sample
         warmup_epochs: number of warmup epochs
+        report_interval: report loss every N batches
         resume_from: path to checkpoint to resume from
         stop_callback: callable() -> bool, returns True if training should stop
         device: torch device ('cuda' or 'cpu')
         log_callback: callable(str) for progress logging
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
+        step_callback: callable(step, epoch, loss) for step progress
 
     Returns:
         best_loss: float, the best training loss achieved
@@ -152,6 +156,8 @@ def train_mae_from_data(
         stop_callback,
         epoch_callback,
         scaler,
+        step_callback,
+        report_interval,
     )
 
     return best_loss
@@ -171,6 +177,8 @@ def train_mae(
     stop_callback=None,
     epoch_callback=None,
     scaler=None,
+    step_callback=None,
+    report_interval=10,
 ):
     """Train a PointNextMAE model.
 
@@ -190,6 +198,8 @@ def train_mae(
         stop_callback: callable() -> bool, returns True if training should stop
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
         scaler: GradScaler for AMP (None = no AMP)
+        step_callback: callable(step, epoch, loss) for step progress
+        report_interval: report loss every N batches
 
     Returns:
         best_loss: float
@@ -198,6 +208,7 @@ def train_mae(
     best_loss = float('inf')
     stopped = False
     use_amp = scaler is not None
+    global_step = 0
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         total_loss = 0.0
@@ -225,14 +236,19 @@ def train_mae(
             else:
                 optimizer.step()
 
-            total_loss += loss.item()
+            batch_loss = loss.item()
+            total_loss += batch_loss
             num_batches += 1
+            global_step += 1
 
             if stop_callback and stop_callback():
                 if log_callback:
                     log_callback('Training stopped by user')
                 stopped = True
                 break
+
+            if step_callback and global_step % report_interval == 0:
+                step_callback(global_step, epoch, batch_loss)
 
         if stopped:
             break
@@ -244,6 +260,8 @@ def train_mae(
             log_callback(f'Epoch {epoch}/{num_epochs} - Loss: {avg_loss:.4f}')
         if epoch_callback:
             epoch_callback(epoch, num_epochs, avg_loss)
+        if step_callback:
+            step_callback(global_step, epoch, avg_loss)
 
         if avg_loss < best_loss:
             best_loss = avg_loss
