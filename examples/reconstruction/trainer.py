@@ -31,7 +31,7 @@ def train_mae_from_data(
     lr=0.001,
     in_channels=6,
     num_points=1024,
-    warmup_epochs=0,
+    warmup_steps=0,
     report_interval=10,
     resume_from=None,
     stop_callback=None,
@@ -39,6 +39,7 @@ def train_mae_from_data(
     log_callback=None,
     epoch_callback=None,
     step_callback=None,
+    reconstruction_callback=None,
 ):
     """Train a PointNextMAE model from raw data.
 
@@ -56,7 +57,7 @@ def train_mae_from_data(
         lr: learning rate
         in_channels: number of input channels (3 + features)
         num_points: number of points per sample
-        warmup_epochs: number of warmup epochs
+        warmup_steps: number of warmup steps (batches)
         report_interval: report loss every N batches
         resume_from: path to checkpoint to resume from
         stop_callback: callable() -> bool, returns True if training should stop
@@ -64,6 +65,7 @@ def train_mae_from_data(
         log_callback: callable(str) for progress logging
         epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
         step_callback: callable(step, epoch, loss) for step progress
+        reconstruction_callback: callable(uuid, positions, predictions) for reconstruction visualization
 
     Returns:
         best_loss: float, the best training loss achieved
@@ -85,6 +87,9 @@ def train_mae_from_data(
     if log_callback:
         log_callback(f'Train dataset: {len(dataset)} samples')
 
+    batches_per_epoch = len(dataset) // batch_size
+    total_steps = num_epochs * batches_per_epoch
+
     # Build model
     model = _build_model(config_path, in_channels)
     model = model.to(device)
@@ -101,7 +106,7 @@ def train_mae_from_data(
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=num_epochs,
+        T_max=total_steps,
         eta_min=1e-5,
     )
 
@@ -121,18 +126,18 @@ def train_mae_from_data(
                 log_callback(f'Warning: Checkpoint not found: {resume_from}')
 
     # Apply warmup if fresh training
-    if start_epoch == 0 and warmup_epochs > 0:
+    if start_epoch == 0 and warmup_steps > 0:
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[
                 torch.optim.lr_scheduler.LinearLR(
-                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
                 ),
                 torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-5
+                    optimizer, T_max=total_steps - warmup_steps, eta_min=1e-5
                 ),
             ],
-            milestones=[warmup_epochs],
+            milestones=[warmup_steps],
         )
 
     # Training loop
@@ -158,6 +163,8 @@ def train_mae_from_data(
         scaler,
         step_callback,
         report_interval,
+        reconstruction_callback,
+        start_epoch * len(train_loader),
     )
 
     return best_loss
@@ -179,6 +186,8 @@ def train_mae(
     scaler=None,
     step_callback=None,
     report_interval=10,
+    reconstruction_callback=None,
+    initial_global_step=0,
 ):
     """Train a PointNextMAE model.
 
@@ -200,6 +209,8 @@ def train_mae(
         scaler: GradScaler for AMP (None = no AMP)
         step_callback: callable(step, epoch, loss) for step progress
         report_interval: report loss every N batches
+        reconstruction_callback: callable(uuid, positions, predictions) for reconstruction visualization
+        initial_global_step: global step to start from (for resume)
 
     Returns:
         best_loss: float
@@ -208,11 +219,15 @@ def train_mae(
     best_loss = float('inf')
     stopped = False
     use_amp = scaler is not None
-    global_step = 0
+    global_step = initial_global_step
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         total_loss = 0.0
         num_batches = 0
+        epoch_start_time = time.time()
+        report_loss_sum = 0.0
+        report_batch_count = 0
+        last_avg_batch_loss = 0.0
 
         for batch in train_loader:
             data = {k: v.to(device, non_blocking=True) for k, v in batch.items() if k != 'uuids'}
@@ -238,8 +253,11 @@ def train_mae(
 
             batch_loss = loss.item()
             total_loss += batch_loss
+            report_loss_sum += batch_loss
+            report_batch_count += 1
             num_batches += 1
             global_step += 1
+            scheduler.step()
 
             if stop_callback and stop_callback():
                 if log_callback:
@@ -248,20 +266,46 @@ def train_mae(
                 break
 
             if step_callback and global_step % report_interval == 0:
-                step_callback(global_step, epoch, batch_loss)
+                last_avg_batch_loss = report_loss_sum / report_batch_count
+                step_callback(global_step, epoch, last_avg_batch_loss)
+                if log_callback:
+                    elapsed = time.time() - epoch_start_time
+                    iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
+                    lr = scheduler.get_last_lr()[0] if scheduler else lr
+                    log_callback(f'Step {global_step} (epoch {epoch}) - Avg Loss: {last_avg_batch_loss:.4f} | LR: {lr:.6f} | {iters_per_sec:.1f} it/s')
+                report_loss_sum = 0.0
+                report_batch_count = 0
+
+            if reconstruction_callback and global_step % report_interval == 0:
+                uuid = batch['uuids'][0] if isinstance(batch['uuids'], (list, tuple)) else batch['uuids'].item()
+                positions = data['pos'][0].cpu().numpy()
+                predictions = pred[0, ..., :3].detach().float().cpu().numpy()
+                reconstruction_callback(uuid, positions, predictions)
 
         if stopped:
             break
 
-        scheduler.step()
         avg_loss = total_loss / max(num_batches, 1)
 
-        if log_callback:
-            log_callback(f'Epoch {epoch}/{num_epochs} - Loss: {avg_loss:.4f}')
+        if global_step % report_interval == 0:
+            if log_callback:
+                elapsed = time.time() - epoch_start_time
+                iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
+                lr = scheduler.get_last_lr()[0] if scheduler else lr
+                log_callback(f'Epoch {epoch}/{num_epochs} - Avg Loss: {avg_loss:.4f} | Step {global_step} - Avg Loss: {last_avg_batch_loss:.4f} | LR: {lr:.6f} | {iters_per_sec:.1f} it/s')
+        else:
+            if log_callback:
+                elapsed = time.time() - epoch_start_time
+                iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
+                lr = scheduler.get_last_lr()[0] if scheduler else lr
+                log_callback(f'Epoch {epoch}/{num_epochs} - Avg Loss: {avg_loss:.4f} | LR: {lr:.6f} | {iters_per_sec:.1f} it/s')
         if epoch_callback:
             epoch_callback(epoch, num_epochs, avg_loss)
-        if step_callback:
-            step_callback(global_step, epoch, avg_loss)
+        if reconstruction_callback:
+            positions = data['pos'][0].cpu().numpy()
+            predictions = pred[0, ..., :3].detach().float().cpu().numpy()
+            uuid = batch['uuids'][0] if isinstance(batch['uuids'], (list, tuple)) else batch['uuids'].item()
+            reconstruction_callback(uuid, positions, predictions)
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -486,14 +530,14 @@ def _load_checkpoint(model, checkpoint_path):
 
     state_dict = torch.load(checkpoint_path, map_location='cpu')
 
+    # Read in_channels from checkpoint metadata (top-level)
+    in_channels = state_dict.get('in_channels', None)
+
     # Handle different checkpoint formats
     ckpt_state_dict = state_dict
     for key in ['model', 'net', 'network', 'state_dict', 'base_model', 'model_state_dict']:
         if key in state_dict:
             ckpt_state_dict = state_dict[key]
-
-    # Read in_channels from checkpoint metadata
-    in_channels = ckpt_state_dict.get('in_channels', None)
 
     base_ckpt = {k.replace('module.', ''): v for k, v in ckpt_state_dict.items()}
     model.load_state_dict(base_ckpt, strict=True)
@@ -519,20 +563,17 @@ def _load_training_checkpoint(checkpoint_path, model, optimizer, scheduler, devi
     # Load model weights with full format/DDP handling
     _, _ = _load_checkpoint(model, checkpoint_path)
 
-    # Load optimizer/scheduler/epoch from checkpoint
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    for key in ['model', 'net', 'network', 'state_dict', 'base_model', 'model_state_dict']:
-        if key in state_dict:
-            state_dict = state_dict[key]
+    # Load checkpoint (keep top-level dict intact)
+    full_state = torch.load(checkpoint_path, map_location=device)
 
-    start_epoch = state_dict.get('epoch', 0)
-    if 'optimizer_state_dict' in state_dict:
-        optimizer.load_state_dict(state_dict['optimizer_state_dict'])
-    if 'scheduler_state_dict' in state_dict:
-        try:
-            scheduler.load_state_dict(state_dict['scheduler_state_dict'])
-        except Exception:
-            pass
+    # Read epoch from top-level
+    start_epoch = full_state.get('epoch', 0)
+
+    # Load optimizer and scheduler from top-level keys
+    if 'optimizer_state_dict' in full_state:
+        optimizer.load_state_dict(full_state['optimizer_state_dict'])
+    if 'scheduler_state_dict' in full_state:
+        scheduler.load_state_dict(full_state['scheduler_state_dict'])
 
     return start_epoch
 
