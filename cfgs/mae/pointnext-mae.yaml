@@ -1,6 +1,22 @@
+batch_size: 512
+dataset:
+  NAME: TBODataset
+  num_points: 1024
+epochs: 51
+lr: 0.0021
+min_lr: 1.0e-05
 model:
   NAME: PointNextMAE
-  decoder_hidden_dim: 512
+  criterion_args:
+    NAME: FeatureWeightedChamfer
+    feature_alpha: 0.0
+    feature_column: combined
+    feature_weight: 0.0
+  decoder_channels:
+  - xyz_x
+  - xyz_y
+  - xyz_z
+  decoder_hidden_dim: 2048
   decoder_points: 1024
   encoder_args:
     NAME: PointNextEncoder
@@ -22,7 +38,8 @@ model:
     group_args:
       NAME: ballquery
       normalize_dp: true
-    in_channels: 4
+    jitter_prob: 0.9
+    jitter_sigma: 0.01
     norm_args:
       norm: bn
     nsample: 32
@@ -38,18 +55,18 @@ model:
     - 2
     - 1
     width: 32
+  encoder_channels:
+  - xyz_x
+  - xyz_y
+  - xyz_z
   jitter_prob: 0.9
   jitter_sigma: 0.01
   latent_dim: 256
+optimizer:
+  NAME: adamw
+  weight_decay: 0.02
+sched: warmup_cosine
 training:
-  batch_size: 512
-  channels:
-    combined: true
-    normal: false
-    surface: false
   device: cuda
-  epochs: 201
-  lr: 0.001
-  num_points: 1024
   report_interval: 10
-  warmup_steps: 200
+warmup_t: 400
