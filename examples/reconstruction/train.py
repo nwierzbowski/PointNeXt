@@ -3,6 +3,7 @@ import os
 import time
 
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 def save_checkpoint(model, optimizer, epoch, loss, path, scheduler=None, in_channels=None, yaml_content=None):
@@ -167,19 +168,36 @@ def run_epoch(
     use_amp = scaler is not None
     last_avg_batch_loss = 0.0
 
-    for batch in train_loader:
+    # Profiling setup - profile first 5 batches for detailed breakdown
+    enable_profiling = os.environ.get('PROFILE_TRAINING', '0') == '1'
+    profiler = None
+    if enable_profiling:
+        profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+        profiler.start()
+
+    for batch_idx, batch in enumerate(train_loader):
+        if enable_profiling and 5 <= batch_idx < 10:
+            profiler.step()
+        
         data = {k: v.to(device, non_blocking=True) for k, v in batch.items() if k != 'uuids'}
 
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-            loss, pred, latent = model(data)
+            with record_function("model_forward"):
+                loss, pred, latent = model(data)
 
         if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
         else:
-            loss.backward()
+            with record_function("model_backward"):
+                loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -188,6 +206,17 @@ def run_epoch(
             scaler.update()
         else:
             optimizer.step()
+
+        if enable_profiling and batch_idx == 9:
+            profiler.stop()
+            print('\n' + '='*80)
+            print('PROFILING RESULTS (batches 5-9, stable warmup)')
+            print('='*80)
+            print('\n--- Top operations by CUDA time ---')
+            print(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+            print('\n--- Top operations by CPU time ---')
+            print(profiler.key_averages().table(sort_by="cpu_time_total", row_limit=30))
+            print('='*80 + '\n')
 
         batch_loss = loss.item()
         total_loss += batch_loss

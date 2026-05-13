@@ -190,10 +190,10 @@ def setup(
         dataset,
         batch_size=batch_size,
         shuffle=mode == 'train',
-        num_workers=8,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=6,
+        prefetch_factor=3,
         collate_fn=dataset.collate_fn,
     )
     if log_callback:
