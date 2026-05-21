@@ -1,0 +1,32 @@
+batch_size: 128
+criterion:
+  NAME: PeelerLoss
+  membership_weight: 1.0
+dataset:
+  NAME: PeelerDataset
+  max_asset_fragments: 100
+  num_assets_per_soup: 6
+  seed: 42
+embedding_noise_sigma: 0.001
+epochs: 100
+lr: 0.0014
+model:
+  NAME: Peeler
+  anchor_drop_rate: 0.2
+  embed_dim: 256
+  lift_drop_rate: 0.1
+  model_dim: 256
+  pose_dim: 15
+  relation_drop_rate: 0.2
+onecycle:
+  anneal_strategy: cos
+  div_factor: 25
+  final_div_factor: 1000
+  pct_start: 0.1
+optimizer:
+  NAME: adamw
+  weight_decay: 0.1
+sched: onecycle
+training:
+  device: cuda
+  report_interval: 10
