@@ -34,7 +34,8 @@ def _build_peeler_dataset(cfg, all_embeddings, all_transforms):
     return PeelerDataset(
         all_embeddings=all_embeddings,
         all_transforms=all_transforms,
-        num_assets_per_soup=dataset_cfg.get('num_assets_per_soup', 10),
+        max_assets_per_soup=dataset_cfg.get('max_assets_per_soup', 10),
+        min_assets_per_soup=dataset_cfg.get('min_assets_per_soup', 2),
         max_asset_fragments=dataset_cfg.get('max_asset_fragments', None),
         seed=dataset_cfg.get('seed', 42),
     )
