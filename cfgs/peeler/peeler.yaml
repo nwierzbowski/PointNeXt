@@ -5,20 +5,21 @@ criterion:
 dataset:
   NAME: PeelerDataset
   max_asset_fragments: 100
-  max_assets_per_soup: 6
+  max_assets_per_soup: 2
   min_assets_per_soup: 2
   seed: 42
-embedding_noise_sigma: 0.0
-epochs: 400
+  translation_scale: 2.0
+embedding_noise_sigma: 0.001
+epochs: 200
 lr: 0.0001
 model:
   NAME: Peeler
-  anchor_drop_rate: 0.1
+  anchor_drop_rate: 0.0
   embed_dim: 256
-  lift_drop_rate: 0.05
-  model_dim: 256
+  lift_drop_rate: 0.0
+  model_dim: 512
   pose_dim: 15
-  relation_drop_rate: 0.1
+  relation_drop_rate: 0.15
 onecycle:
   anneal_strategy: cos
   div_factor: 25

@@ -119,6 +119,9 @@ def train(
 
         model.train()
         total_loss = 0.0
+        total_bce = 0.0
+        total_anchor = 0.0
+        total_entropy = 0.0
         num_batches = 0
         stopped = False
         use_amp = scaler is not None
@@ -156,6 +159,9 @@ def train(
 
             batch_loss = loss.item()
             total_loss += batch_loss
+            total_bce += loss_dict.get('loss_membership', batch_loss)
+            total_anchor += loss_dict.get('loss_anchor', 0.0)
+            total_entropy += loss_dict.get('loss_entropy', 0.0)
             num_batches += 1
             global_step += 1
 
@@ -167,7 +173,10 @@ def train(
 
             if step_callback and global_step % report_interval == 0:
                 avg_loss = total_loss / num_batches
-                step_callback(global_step, epoch, avg_loss)
+                avg_bce = total_bce / num_batches
+                avg_anchor = total_anchor / num_batches
+                avg_entropy = total_entropy / num_batches
+                step_callback(global_step, epoch, avg_loss, avg_bce, avg_anchor, avg_entropy)
 
                 # Emit soup data for viewport visualization
                 if soup_data_callback:
@@ -178,7 +187,7 @@ def train(
                     lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
                     log_callback(
                         f'Step {global_step} (epoch {epoch}) - '
-                        f'Loss: {avg_loss:.4f} | LR: {lr:.6f} | '
+                        f'BCE: {avg_bce:.4f} + Anchor: {avg_anchor:.4f} - Entropy: {avg_entropy:.4f} = Total: {avg_loss:.4f} | LR: {lr:.6f} | '
                         f'{iters_per_sec:.1f} it/s'
                     )
 
@@ -186,17 +195,23 @@ def train(
             break
 
         avg_loss = total_loss / max(num_batches, 1)
+        avg_bce = total_bce / max(num_batches, 1)
+        avg_anchor = total_anchor / max(num_batches, 1)
+        avg_entropy = total_entropy / max(num_batches, 1)
 
         # Validation every epoch
         val_loss = avg_loss
+        val_bce = avg_bce
+        val_anchor = avg_anchor
+        val_entropy = avg_entropy
         val_acc = 0.0
         val_f1 = 0.0
         if val_loader is not None:
-            val_loss, val_acc, val_f1 = _validate(model, val_loader, criterion, device, scaler)
+            val_loss, val_bce, val_anchor, val_entropy, val_acc, val_f1 = _validate(model, val_loader, criterion, device, scaler)
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
-            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_acc, val_f1, lr)
+            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_acc, val_f1, lr, avg_bce, avg_anchor, avg_entropy, val_bce, val_anchor, val_entropy)
 
         # Best model by selected metric
         metric_values = {
@@ -232,6 +247,9 @@ def _validate(model, val_loader, criterion, device, scaler):
     """Run validation loop and return loss, accuracy, and F1 score."""
     model.eval()
     total_loss = 0.0
+    total_bce = 0.0
+    total_anchor = 0.0
+    total_entropy = 0.0
     correct = 0
     total = 0
     tp = fp = fn = 0
@@ -244,8 +262,11 @@ def _validate(model, val_loader, criterion, device, scaler):
             Y = batch['Y'].to(device)
 
             anchor_probs, membership_logits, _, seed_idx = model(embeddings, transforms, mask)
-            loss, _ = criterion(membership_logits, Y, anchor_probs, seed_idx)
+            loss, loss_dict = criterion(membership_logits, Y, anchor_probs, seed_idx)
             total_loss += loss.item()
+            total_bce += loss_dict.get('loss_membership', loss.item())
+            total_anchor += loss_dict.get('loss_anchor', 0.0)
+            total_entropy += loss_dict.get('loss_entropy', 0.0)
 
             pred = torch.sigmoid(membership_logits) > 0.5
             rows = torch.arange(Y.shape[0], device=Y.device)
@@ -264,10 +285,14 @@ def _validate(model, val_loader, criterion, device, scaler):
             fp += ((pred_mask == 1) & (target_mask == 0)).sum().item()
             fn += ((pred_mask == 0) & (target_mask == 1)).sum().item()
 
-    avg_loss = total_loss / max(len(val_loader), 1)
+    num_batches = max(len(val_loader), 1)
+    avg_loss = total_loss / num_batches
+    avg_bce = total_bce / num_batches
+    avg_anchor = total_anchor / num_batches
+    avg_entropy = total_entropy / num_batches
     accuracy = correct / total if total > 0 else 0.0
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-    return avg_loss, accuracy, f1
+    return avg_loss, avg_bce, avg_anchor, avg_entropy, accuracy, f1
