@@ -25,11 +25,30 @@ import torch.nn as nn
 
 from openpoints.models.build import MODELS
 
-# Feature dimension for backbone (16D features all the way through)
-_FEAT_DIM = 16
 
-# Raw relative feature dimension: dist(1) + direction(3) = 4
-_REL_FEATURE_DIM = 4
+
+
+def _transforms_to_pose(transforms):
+    """Extract translation, scale, and normalized rotation from 4x4 transforms.
+
+    Args:
+        transforms: (B, N, 16) f32 - row-major 4x4 matrices
+
+    Returns:
+        translation: (B, N, 3)
+        scale: (B, N, 1) clamped to min 1e-8
+        rot: (B, N, 9) flattened normalized rotation matrix
+    """
+    B, N, _ = transforms.shape
+    mat = transforms.view(B, N, 4, 4)
+    translation = mat[:, :, :3, 3]
+    scale = torch.norm(mat[:, :, :3, :3], dim=-1).mean(-1, keepdim=True)
+    scale = torch.clamp(scale, min=1e-8)
+    rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
+    return translation, scale, rot
+
+# Pose feature dimension: translation(3) + scale(1)
+_POSE_DIM = 4
 
 
 class SimpleAttentionBlock(nn.Module):
@@ -58,23 +77,24 @@ class PeelerBackbone(nn.Module):
     """MLP projection → self-attention → max pool backbone.
 
     Input: transforms(N, 16)
-    Output: scene_vec(1, 16)
+    Output: scene_vec(1, feat_dim)
     """
 
     def __init__(
         self,
-        model_dim,  # pass-through, unused
-        attention_heads=4,
-        attention_blocks=4,
+        feat_dim,
+        attention_heads,
+        attention_blocks,
     ):
         super().__init__()
+        self.feat_dim = feat_dim
 
-        self.proj = nn.Linear(4, _FEAT_DIM)
+        self.proj = nn.Linear(_POSE_DIM, self.feat_dim)
         self.blocks = nn.ModuleList([
-            SimpleAttentionBlock(_FEAT_DIM, attention_heads)
+            SimpleAttentionBlock(self.feat_dim, attention_heads)
             for _ in range(attention_blocks)
         ])
-        self.norm = nn.LayerNorm(_FEAT_DIM)
+        self.norm = nn.LayerNorm(self.feat_dim)
 
     def forward(self, transforms):
         """Forward pass for backbone.
@@ -85,15 +105,8 @@ class PeelerBackbone(nn.Module):
         Returns:
             scene_vec: (B, 1, 16) - global scene vector
         """
-        B, N, _ = transforms.shape
-        mat = transforms.view(B, N, 4, 4)
-
-        translation = mat[:, :, :3, 3]
-        scale = torch.norm(mat[:, :, :3, :3], dim=-1).mean(-1, keepdim=True)
-        scale = torch.clamp(scale, min=1e-8)
-
-        pos = translation  # (B, N, 3)
-        x = torch.cat([pos, scale], dim=-1)  # (B, N, 4)
+        translation, scale, _ = _transforms_to_pose(transforms)
+        x = torch.cat([translation, scale], dim=-1)  # (B, N, 4)
         x = self.proj(x)  # (B, N, 16)
 
         for block in self.blocks:
@@ -113,37 +126,41 @@ class PeelerLoop(nn.Module):
     Training: full NxN membership matrix for gradient flow to all anchors.
     ONNX Export: only computes 1×N for best anchor (avoids NxN computation).
 
-    Input: scene_vec(1,16), transforms(N,16), embeddings(N,256), mask(N)
+    Input: scene_vec(1,feat_dim), transforms(N,16), embeddings(N,256), mask(N)
     Output: anchor_scores(N), membership_logits(N) [export] or (N,N) [training]
     """
 
-    def __init__(self, model_dim, anchor_drop_rate, relation_drop_rate):
+    def __init__(self, feat_dim, rel_hidden_dim, anchor_drop_rate, relation_drop_rate):
         super().__init__()
-        self.model_dim = model_dim  # pass-through, unused
+        self.feat_dim = feat_dim
+        self.rel_hidden_dim = rel_hidden_dim
 
         # Anchor head: MLP that scores each fragment as a potential anchor seed
         # Uses pose features (translation + scale) instead of embeddings
         # High scores -> complex, identifiable parts (receiver, barrel)
         # Low scores -> simple, redundant parts (screws, noise)
-        self.anchor_pose_proj = nn.Linear(4, _FEAT_DIM)
+        self.anchor_pose_proj = nn.Linear(_POSE_DIM, self.feat_dim)
         self.anchor_mlp = nn.Sequential(
-            nn.Linear(_FEAT_DIM * 2, _FEAT_DIM),
+            nn.Linear(self.feat_dim * 2, self.feat_dim * 4),
             nn.GELU(),
             nn.Dropout(anchor_drop_rate),
-            nn.Linear(_FEAT_DIM, 1),
+            nn.Linear(self.feat_dim * 4, self.feat_dim),
+            nn.GELU(),
+            nn.Dropout(anchor_drop_rate),
+            nn.Linear(self.feat_dim, 1),
         )
 
         # Relation head: MLP that computes membership logits from relative features
         self.relation_mlp = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM, 128),
+            nn.Linear(_REL_FEATURE_DIM, self.rel_hidden_dim),
             nn.GELU(),
             nn.Dropout(relation_drop_rate),
-            # nn.Linear(128, 128),
-            # nn.GELU(),
-            nn.Linear(128, 64),
+            nn.Linear(self.rel_hidden_dim, self.rel_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.rel_hidden_dim, self.rel_hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(relation_drop_rate),
-            nn.Linear(64, 1),
+            nn.Linear(self.rel_hidden_dim // 2, 1),
         )
 
     def forward(self, scene_vec, transforms, embeddings=None, mask=None):
@@ -160,35 +177,29 @@ class PeelerLoop(nn.Module):
             membership_logits: (B, N) for ONNX export, (B, N, N) for training
         """
         B, N, _ = transforms.shape
-        # B, C, _ = seed_pose.shape
-        # _, N, _ = cand_pose.shape
 
         # Extract pose features (translation + scale) from transforms for anchor head
-        mat = transforms.view(B, N, 4, 4)
-        translation = mat[:, :, :3, 3]
-        scale = torch.norm(mat[:, :, :3, :3], dim=-1).mean(-1, keepdim=True)
-        scale = torch.clamp(scale, min=1e-8)
+        translation, scale, rot = _transforms_to_pose(transforms)
         pose_input = torch.cat([translation, scale], dim=-1)  # (B, N, 4)
 
         # Anchor head: score ALL fragments as anchors in parallel
-        pose_proj = self.anchor_pose_proj(pose_input)  # (B, N, 16)
-        scene_expanded = scene_vec.expand(-1, N, _FEAT_DIM)  # (B, N, 16)
-        context = torch.cat([scene_expanded, pose_proj], dim=-1)  # (B, N, 32)
+        pose_proj = self.anchor_pose_proj(pose_input)  # (B, N, feat_dim)
+        scene_expanded = scene_vec.expand(-1, N, self.feat_dim)  # (B, N, feat_dim)
+        context = torch.cat([scene_expanded, pose_proj], dim=-1)  # (B, N, feat_dim*2)
         anchor_scores = self.anchor_mlp(context).squeeze(-1)  # (B, N)
-
-        # Decompose transforms -> full pose features (for relation head)
-        pose_features = self._decompose_pose(transforms)  # (B, N, 13)
 
         if torch.onnx.is_in_onnx_export():
             # ONNX export: only compute affinities for top anchor (avoids NxN)
             seed_idx = torch.argmax(anchor_scores, dim=1)  # (B,)
 
-            # Gather seed pose
-            seed_idx_expanded = seed_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, 13)  # (B, 1, 13)
-            seed_pose = torch.gather(pose_features, 1, seed_idx_expanded)  # (B, 1, 13)
+            # Gather seed translation and scale
+            seed_idx_T = seed_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, 3)  # (B, 1, 3)
+            seed_idx_S = seed_idx.unsqueeze(1).unsqueeze(2).expand(-1, -1, 1)  # (B, 1, 1)
+            seed_T = torch.gather(translation, 1, seed_idx_T)  # (B, 1, 3)
+            seed_S = torch.gather(scale, 1, seed_idx_S).squeeze(-1)  # (B, 1)
 
-            # Compute relative features: seed vs all N candidates → (B, 1, N, 4)
-            rel_features = self._compute_relative_features(seed_pose, pose_features)  # (B, 1, N, 4)
+            # Compute relative features: seed vs all N candidates
+            rel_features = self._compute_relative_features(seed_T, seed_S, translation, scale.squeeze(-1))  # (B, 1, N, 6)
 
             # Relation head → (B, 1, N, 1) → (B, 1, N) → (B, N)
             membership_logits = self.relation_mlp(rel_features).squeeze(-1)  # (B, 1, N, 1) → (B, 1, N)
@@ -196,7 +207,7 @@ class PeelerLoop(nn.Module):
             membership_logits = membership_logits + (1 - mask) * -1e9
         else:
             # Training: full NxN for gradient flow to all anchors
-            rel_features = self._compute_relative_features(pose_features, pose_features)  # (B, N, N, 4)
+            rel_features = self._compute_relative_features(translation, scale.view(B, N), translation, scale.squeeze(-1))  # (B, N, N, 6)
 
             # Relation head → (B, N, N)
             membership_logits = self.relation_mlp(rel_features).squeeze(-1)  # (B, N, N)
@@ -206,94 +217,50 @@ class PeelerLoop(nn.Module):
 
         return anchor_scores, membership_logits
 
-    def _decompose_pose(self, transforms):
-        """Decompose 4x4 world matrices into pose features.
-
-        Args:
-            transforms: (B, N, 16) f32 - row-major 4x4 matrices
-
-        Returns:
-            pose_features: (B, N, 13) f32 - [T(3), S(1), R(9)]
-        """
-        B, N, _ = transforms.shape
-        mat = transforms.view(B, N, 4, 4)
-
-        translation = mat[:, :, :3, 3]
-        scale = torch.norm(mat[:, :, :3, :3], dim=-1).mean(-1, keepdim=True).unsqueeze(-1)
-        
-        # DEBUG: Check scale before clamp
-        # if not torch.isfinite(scale).all():
-        #     nan_count = (~torch.isfinite(scale)).sum().item()
-        #     print(f'WARNING: scale has {nan_count} non-finite values BEFORE clamp')
-        #     finite_mask = torch.isfinite(scale)
-        #     if finite_mask.any():
-        #         print(f'  scale stats: min={scale[finite_mask].min():.4f}, max={scale[finite_mask].max():.4f}')
-        #     print(f'  transforms stats: min={transforms.min():.4f}, max={transforms.max():.4f}')
-        
-        scale = torch.clamp(scale, min=1e-8)
-        rot = mat[:, :, :3, :3] / scale
-        rot_flat = rot.reshape(B, N, -1)
-
-        pose_features = torch.cat([translation, scale.view(B, N, 1), rot_flat], dim=-1)
-        
-        # DEBUG: Check pose_features before nan_to_num
-        # if not torch.isfinite(pose_features).all():
-        #     nan_count = (~torch.isfinite(pose_features)).sum().item()
-        #     print(f'WARNING: pose_features has {nan_count} non-finite values BEFORE nan_to_num')
-        
-        # result = torch.nan_to_num(pose_features, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        # DEBUG: Check result after nan_to_num
-        # if not torch.isfinite(result).all():
-        #     nan_count = (~torch.isfinite(result)).sum().item()
-        #     print(f'WARNING: result has {nan_count} non-finite values AFTER nan_to_num (BUG!)')
-        
-        return pose_features
-
-    def _compute_relative_features(self, seed_pose, cand_pose):
+    def _compute_relative_features(self, seed_T, seed_S, cand_T, cand_S):
         """Compute relative features between seed and candidate poses.
 
         Args:
-            seed_pose: (B, S, 13) f32 - seed pose features [T(3), S(1), R(9)]
-            cand_pose: (B, N, 13) f32 - candidate pose features [T(3), S(1), R(9)]
+            seed_T: (B, S, 3) f32 - seed translations
+            seed_S: (B, S) f32 - seed scales
+            cand_T: (B, N, 3) f32 - candidate translations
+            cand_S: (B, N) f32 - candidate scales
 
         Returns:
-            rel_features: (B, S, N, 4) f32 - [dist(1), direction(3)] with scale normalization
+            rel_features: (B, S, N, 6) f32 - [dist(1), dist_norm_s(1), dist_norm_c(1), seed_S_log(1), cand_S_log(1), rel_scale(1)]
         """
-        seed_T = seed_pose[:, :, :3]  # (B, S, 3)
-        seed_S = seed_pose[:, :, 3]  # (B, S) - scale at index 3
-        cand_T = cand_pose[:, :, :3]  # (B, N, 3)
-        cand_S = cand_pose[:, :, 3]
-        
-        # DEBUG: Check seed_S
-        # if not torch.isfinite(seed_S).all():
-        #     nan_count = (~torch.isfinite(seed_S)).sum().item()
-        #     print(f'WARNING: seed_S has {nan_count} non-finite values')
-        #     finite_mask = torch.isfinite(seed_S)
-        #     if finite_mask.any():
-        #         print(f'  seed_S stats: min={seed_S[finite_mask].min():.4f}, max={seed_S[finite_mask].max():.4f}')
-
         diff = cand_T.unsqueeze(1) - seed_T.unsqueeze(2)  # (B, S, N, 3)
+
+        B, S, N, _ = diff.size()
+
         dist_raw = torch.norm(diff, dim=-1, keepdim=True)  # (B, S, N, 1)
         
         # Normalize distance by seed scale (division in linear space)
-        seed_S_expanded = seed_S.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
-        cand_S_expanded = cand_S.unsqueeze(1).unsqueeze(-1) # (B, 1, N, 1)
-        dist_normalized = dist_raw / (seed_S_expanded)
-        
-        # DEBUG: Check dist_normalized
-        # if not torch.isfinite(dist_normalized).all():
-        #     nan_count = (~torch.isfinite(dist_normalized)).sum().item()
-        #     print(f'WARNING: dist_normalized has {nan_count} non-finite values')
-        #     finite_mask = torch.isfinite(seed_S_expanded)
-        #     if finite_mask.any():
-        #         print(f'  seed_S_expanded stats: min={seed_S_expanded[finite_mask].min():.4f}, max={seed_S_expanded[finite_mask].max():.4f}')
-        
-        dist = torch.log1p(dist_normalized)
-        
-        direction_normalized = diff / (dist_raw + 1e-8)  # (B, S, N, 3)
+        seed_S_exp = seed_S.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
+        cand_S_exp = cand_S.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
 
-        return torch.cat([dist, direction_normalized], dim=-1)  # (B, S, N, 4)
+        dist_normalized_s = dist_raw / seed_S_exp
+        dist_normalized_s = torch.log10(dist_normalized_s + 1e-8)
+
+        dist_normalized_c = dist_raw / cand_S_exp
+        dist_normalized_c = torch.log10(dist_normalized_c + 1e-8)
+        
+        dist = torch.log10(dist_raw + 1e-8)
+        
+        # Log-scale ratio
+        rel_scale = torch.log10(cand_S_exp / seed_S_exp)  # (B, S, N, 1)
+
+        seed_S_log = torch.log10(seed_S_exp.expand(-1, -1, N, -1))
+        cand_S_log = torch.log10(cand_S_exp.expand(-1, S, -1, -1))
+        
+        # Normalized direction
+        direction = diff / (dist_raw + 1e-8)  # (B, S, N, 3)
+
+        return torch.cat([dist, dist_normalized_s, dist_normalized_c, seed_S_log, cand_S_log, rel_scale], dim=-1)  # (B, S, N, 6)
+
+
+# Output dimension of _compute_relative_features
+_REL_FEATURE_DIM = 6  # dist + dist_norm_s + dist_norm_c + seed_S_log + cand_S_log + rel_scale
 
 
 @MODELS.register_module()
@@ -312,24 +279,27 @@ class Peeler(nn.Module):
 
     def __init__(
         self,
-        model_dim,
+        feat_dim,
+        rel_hidden_dim,
         anchor_drop_rate,
         relation_drop_rate,
-        attention_heads=8,
-        attention_blocks=4,
+        attention_heads,
+        attention_blocks,
         **kwargs,
     ):
         super().__init__()
+        self.feat_dim = feat_dim
+        self.rel_hidden_dim = rel_hidden_dim
 
         # PeelerBackbone: MLP → self-attention → max pool
         self.backbone = PeelerBackbone(
-            model_dim,
+            feat_dim,
             attention_heads=attention_heads,
             attention_blocks=attention_blocks,
         )
 
         # PeelerLoop: single-fragment iteration (anchor scoring + relation scoring)
-        self.peeler_loop = PeelerLoop(model_dim, anchor_drop_rate, relation_drop_rate)
+        self.peeler_loop = PeelerLoop(feat_dim, rel_hidden_dim, anchor_drop_rate, relation_drop_rate)
 
     def forward(self, embeddings, transforms, mask):
         """Forward pass (softmax all the way through).
@@ -347,7 +317,7 @@ class Peeler(nn.Module):
         N = int(transforms.shape[1])
 
         # Step 1: Run backbone once to get scene vector
-        scene_vec = self.backbone(transforms)  # (B, 1, model_dim)
+        scene_vec = self.backbone(transforms)  # (B, 1, feat_dim)
 
         # Step 2: Compute all anchor scores and NxN membership logits in one pass
         anchor_logits, affinity_logits = self.peeler_loop(scene_vec, transforms, embeddings, mask)

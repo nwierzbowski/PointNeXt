@@ -24,11 +24,12 @@ lr: 0.01
 model:
   NAME: Peeler
   anchor_drop_rate: 0.1
-  attention_blocks: 4
-  attention_heads: 8
+  attention_blocks: 2
+  attention_heads: 4
   embed_dim: 256
+  feat_dim: 64
   lift_drop_rate: 0.0
-  model_dim: 128
+  rel_hidden_dim: 128
   relation_drop_rate: 0.0
   spatial_only: true
 onecycle:
