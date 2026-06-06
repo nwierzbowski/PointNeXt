@@ -29,7 +29,7 @@ def _build_peeler_dataset(cfg, all_embeddings, all_transforms):
     Returns:
         PeelerDataset instance
     """
-    from openpoints.dataset.peeler_dataset import PeelerDataset
+    from peeler.dataset import PeelerDataset
     dataset_cfg = cfg.dataset
     return PeelerDataset(
         all_embeddings=all_embeddings,

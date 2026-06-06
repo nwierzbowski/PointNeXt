@@ -58,4 +58,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["openpoints*", "examples*"]
+include = ["openpoints*", "examples*", "peeler*"]
