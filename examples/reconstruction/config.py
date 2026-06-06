@@ -190,7 +190,7 @@ def setup(
         dataset,
         batch_size=batch_size,
         shuffle=mode == 'train',
-        num_workers=2,
+        num_workers=1,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=3,

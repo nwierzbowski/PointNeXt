@@ -106,6 +106,7 @@ def train(
     step_callback=None,
     soup_data_callback=None,
     report_interval=10,
+    ema_alpha=0.1,
     best_metric='val_loss',
     embedding_noise_sigma=0.0,
 ):
@@ -113,15 +114,16 @@ def train(
     best_metric_value = float('inf') if best_metric != 'f1' else -1.0
     best_epoch = 0
     global_step = 0
+    ema_loss = None
+    ema_bce = None
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
+        train_loader.dataset.set_epoch(epoch)
         epoch_start_time = time.time()
 
         model.train()
         total_loss = 0.0
         total_bce = 0.0
-        total_anchor = 0.0
-        total_entropy = 0.0
         num_batches = 0
         stopped = False
         use_amp = scaler is not None
@@ -132,14 +134,14 @@ def train(
             if embedding_noise_sigma > 0:
                 embeddings = embeddings + torch.randn_like(embeddings) * embedding_noise_sigma
             transforms = batch['transforms'].to(device, dtype=dtype, non_blocking=True)
-            mask = batch['mask'].to(device, dtype=dtype, non_blocking=True)
+            mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
             Y = batch['Y'].to(device, dtype=dtype, non_blocking=True)
 
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-                anchor_probs, membership_logits, _, seed_idx = model(embeddings, transforms, mask)
-                loss, loss_dict = criterion(membership_logits, Y, anchor_probs, seed_idx)
+                anchor_probs, affinity_logits = model(embeddings, transforms, mask)
+                loss, loss_dict = criterion(anchor_probs, affinity_logits, Y, mask)
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -155,13 +157,11 @@ def train(
             else:
                 optimizer.step()
 
-            scheduler.step_update(global_step) if hasattr(scheduler, 'step_update') else scheduler.step()
-
             batch_loss = loss.item()
+
+            scheduler.step_update(global_step) if hasattr(scheduler, 'step_update') else scheduler.step()
             total_loss += batch_loss
-            total_bce += loss_dict.get('loss_membership', batch_loss)
-            total_anchor += loss_dict.get('loss_anchor', 0.0)
-            total_entropy += loss_dict.get('loss_entropy', 0.0)
+            total_bce += loss_dict.get('loss_bce', batch_loss)
             num_batches += 1
             global_step += 1
 
@@ -172,46 +172,50 @@ def train(
                 break
 
             if step_callback and global_step % report_interval == 0:
-                avg_loss = total_loss / num_batches
-                avg_bce = total_bce / num_batches
-                avg_anchor = total_anchor / num_batches
-                avg_entropy = total_entropy / num_batches
-                step_callback(global_step, epoch, avg_loss, avg_bce, avg_anchor, avg_entropy)
+                if ema_loss is None:
+                    ema_loss = batch_loss
+                    ema_bce = loss_dict.get('loss_bce', batch_loss)
+                else:
+                    ema_loss = ema_alpha * batch_loss + (1 - ema_alpha) * ema_loss
+                    ema_bce = ema_alpha * loss_dict.get('loss_bce', batch_loss) + (1 - ema_alpha) * ema_bce
+                step_callback(global_step, epoch, ema_loss, ema_bce)
 
                 # Emit soup data for viewport visualization
                 if soup_data_callback:
-                    soup_data_callback(batch, membership_logits, seed_idx, model)
+                    seed_idx = torch.argmax(anchor_probs, dim=-1)
+                    soup_data_callback(batch, anchor_probs, affinity_logits, model)
                 if log_callback:
                     elapsed = time.time() - epoch_start_time
                     iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
                     lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
                     log_callback(
                         f'Step {global_step} (epoch {epoch}) - '
-                        f'BCE: {avg_bce:.4f} + Anchor: {avg_anchor:.4f} - Entropy: {avg_entropy:.4f} = Total: {avg_loss:.4f} | LR: {lr:.6f} | '
+                        f'BCE: {ema_bce:.4f} = Total: {ema_loss:.4f} | LR: {lr:.6f} | '
                         f'{iters_per_sec:.1f} it/s'
                     )
 
+            # Free intermediate tensors to prevent GPU memory accumulation
+            # del embeddings, transforms, mask, Y, loss, anchor_probs, affinity_logits
         if stopped:
             break
 
+        # Release GPU memory between epochs
+        torch.cuda.empty_cache()
+
         avg_loss = total_loss / max(num_batches, 1)
         avg_bce = total_bce / max(num_batches, 1)
-        avg_anchor = total_anchor / max(num_batches, 1)
-        avg_entropy = total_entropy / max(num_batches, 1)
 
         # Validation every epoch
         val_loss = avg_loss
         val_bce = avg_bce
-        val_anchor = avg_anchor
-        val_entropy = avg_entropy
         val_acc = 0.0
         val_f1 = 0.0
         if val_loader is not None:
-            val_loss, val_bce, val_anchor, val_entropy, val_acc, val_f1 = _validate(model, val_loader, criterion, device, scaler)
+            val_loss, val_bce, val_acc, val_f1 = _validate(model, val_loader, criterion, device, scaler)
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
-            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_acc, val_f1, lr, avg_bce, avg_anchor, avg_entropy, val_bce, val_anchor, val_entropy)
+            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_acc, val_f1, lr, avg_bce, val_bce)
 
         # Best model by selected metric
         metric_values = {
@@ -248,8 +252,6 @@ def _validate(model, val_loader, criterion, device, scaler):
     model.eval()
     total_loss = 0.0
     total_bce = 0.0
-    total_anchor = 0.0
-    total_entropy = 0.0
     correct = 0
     total = 0
     tp = fp = fn = 0
@@ -259,17 +261,18 @@ def _validate(model, val_loader, criterion, device, scaler):
             embeddings = batch['embeddings'].to(device)
             transforms = batch['transforms'].to(device)
             mask = batch['mask'].to(device)
-            Y = batch['Y'].to(device)
+            Y = batch['Y'].to(device).float()
 
-            anchor_probs, membership_logits, _, seed_idx = model(embeddings, transforms, mask)
-            loss, loss_dict = criterion(membership_logits, Y, anchor_probs, seed_idx)
+            anchor_probs, affinity_logits = model(embeddings, transforms, mask)
+            loss, loss_dict = criterion(anchor_probs, affinity_logits, Y, mask)
             total_loss += loss.item()
-            total_bce += loss_dict.get('loss_membership', loss.item())
-            total_anchor += loss_dict.get('loss_anchor', 0.0)
-            total_entropy += loss_dict.get('loss_entropy', 0.0)
+            total_bce += loss_dict.get('loss_bce', loss.item())
 
-            pred = torch.sigmoid(membership_logits) > 0.5
+            # Select best anchor via argmax (inference-time behavior)
+            seed_idx = torch.argmax(anchor_probs, dim=-1)  # (B,)
             rows = torch.arange(Y.shape[0], device=Y.device)
+            membership_logits = affinity_logits[rows, seed_idx]  # (B, N) - logits for selected anchor
+            pred = torch.sigmoid(membership_logits) > 0.5
             Y_selected = Y[rows, seed_idx]  # (B, N)
             target = Y_selected > 0.5
             mask_expanded = mask.float()
@@ -288,11 +291,9 @@ def _validate(model, val_loader, criterion, device, scaler):
     num_batches = max(len(val_loader), 1)
     avg_loss = total_loss / num_batches
     avg_bce = total_bce / num_batches
-    avg_anchor = total_anchor / num_batches
-    avg_entropy = total_entropy / num_batches
     accuracy = correct / total if total > 0 else 0.0
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-    return avg_loss, avg_bce, avg_anchor, avg_entropy, accuracy, f1
+    return avg_loss, avg_bce, accuracy, f1

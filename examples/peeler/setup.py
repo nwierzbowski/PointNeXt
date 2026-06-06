@@ -39,6 +39,8 @@ def _build_peeler_dataset(cfg, all_embeddings, all_transforms):
         max_asset_fragments=dataset_cfg.get('max_asset_fragments', None),
         seed=dataset_cfg.get('seed', 42),
         translation_scale=dataset_cfg.get('translation_scale', 0.0),
+        asset_scale_std=dataset_cfg.get('asset_scale_std', 1.0),
+        scene_scale=dataset_cfg.get('scene_scale', [0.8, 1.2]),
     )
 
 
@@ -119,7 +121,7 @@ def setup(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
         pin_memory=True,
         drop_last=True,
         prefetch_factor=3,
