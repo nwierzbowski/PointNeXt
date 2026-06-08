@@ -4,8 +4,8 @@ criterion:
 dataset:
   NAME: PeelerDataset
   asset_scale_std:
-  - -2.0
-  - 2.0
+  - -1.0
+  - 1.0
   max_asset_fragments: 50
   max_assets_per_soup: 12
   min_assets_per_soup: 2
@@ -16,7 +16,7 @@ dataset:
   seed: 42
   translation_scale:
   - 0.0
-  - 10.0
+  - 1.9
   zero_embeddings: false
 embedding_noise_sigma: 0.005
 epochs: 50

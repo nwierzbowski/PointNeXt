@@ -130,9 +130,10 @@ class PeelerDataset(Dataset):
         # Random translation augmentation: per-asset translation in world space
         translation_scale_range = getattr(self, 'translation_scale')
         offset = 0
+        sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
         for asset_gid in asset_indices:
             n_fragments = len(self.all_transforms[asset_gid])
-            sigma = rng.uniform(translation_scale_range[0], translation_scale_range[1])
+            
             t = rng.randn(3).astype(np.float32) * sigma
             # Translation is at indices 3, 7, 11 of each row (4th column of row-major 4x4)
             soup_trans[offset:offset + n_fragments, 3] += t[0]
