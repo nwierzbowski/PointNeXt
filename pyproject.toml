@@ -40,7 +40,7 @@ dependencies = [
     # Training utilities
     "tqdm==4.62.3",
     "pillow",
-    "protobuf==3.19.4",
+    "protobuf>=3.19.4",
     "multimethod==1.7",
     "ninja==1.10.2.3",
     "Cython==0.29.28",
