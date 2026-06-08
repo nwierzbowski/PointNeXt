@@ -233,11 +233,12 @@ class PeelerBackbone(nn.Module):
         distance = torch.norm(relative_translation, dim=-1, keepdim=True)
 
         dir = torch.where(distance > 1e-8, relative_translation / distance, torch.zeros_like(relative_translation))
-        distance = (torch.log10(distance+1e-8)+3) / 6
-
+        distance = (torch.log10(distance+1e-8) - 0.5) / 1.5
+        norm_scale = (torch.log10(scale)+2)/6
+        # print(torch.max(norm_scale), " - ", torch.min(norm_scale))
 
         # Pose features: [relative_xyz(3) + scale(1) + distance(1)] = 5D
-        pose_features = torch.cat([dir, torch.log10(scale), distance], dim=-1)  # (B, N, 5)
+        pose_features = torch.cat([dir, norm_scale, distance], dim=-1)  # (B, N, 5)
 
         # Project pose features to feat_dim
         x = self.proj(pose_features)  # (B, N, 5) → (B, N, feat_dim)
