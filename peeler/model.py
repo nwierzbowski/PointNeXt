@@ -78,29 +78,44 @@ def _compute_relative_features(seed_T, seed_S, cand_T, cand_S):
     cand_S_exp = cand_S.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
 
     dist_normalized_s = dist_raw / seed_S_exp
-    dist_normalized_s = torch.log1p(dist_normalized_s)
+    dist_normalized_s = torch.log10(torch.clamp(dist_normalized_s, min=1e-8))
+    dist_normalized_s = (dist_normalized_s) / 8
 
     dist_normalized_c = dist_raw / cand_S_exp
-    dist_normalized_c = torch.log1p(dist_normalized_c)
+    dist_normalized_c = torch.log10(torch.clamp(dist_normalized_c, min=1e-8))
+    dist_normalized_c = (dist_normalized_c) / 8
 
     # Distance between centroids taking them as spheres
-    dist_bwn = torch.log10(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8))
+    dist_bwn = torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8)
 
-    dist = torch.log10(dist_raw + 1e-8)
+    dist_bwn_normalized_s = dist_bwn / seed_S_exp
+    dist_bwn_normalized_s = torch.log10(torch.clamp(dist_bwn_normalized_s, min=1e-8))
+    dist_bwn_normalized_s = (dist_bwn_normalized_s) / 8
+
+    dist_bwn_normalized_c = dist_bwn / cand_S_exp
+    dist_bwn_normalized_c = torch.log10(torch.clamp(dist_bwn_normalized_c, min=1e-8))
+    dist_bwn_normalized_c = (dist_bwn_normalized_c) / 8
+
+    dist_bwn = torch.log10(dist_bwn) / 8 + 1
+
+
+
+    dist = torch.log10(torch.clamp(dist_raw, min=1e-8))
+    dist = dist / 8 + 1
 
     # Log-scale ratio
     rel_scale = torch.log10(cand_S_exp / seed_S_exp) / 8  # (B, S, N, 1)
 
-    seed_S_log = torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 8
-    cand_S_log = torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 8
+    seed_S_log = torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 6
+    cand_S_log = torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 6
 
     # Normalized direction
-    direction = diff / (dist_raw + 1e-8)  # (B, S, N, 3)
+    direction = torch.where(dist_raw > 1e-8, diff / dist_raw, torch.zeros_like(diff))  # (B, S, N, 3)
 
-    return torch.cat([dist_raw, dist_bwn, dist_normalized_s, dist_normalized_c, seed_S_log, cand_S_log, rel_scale], dim=-1)  # (B, S, N, 7)
+    return torch.cat([direction, dist, dist_bwn, dist_bwn_normalized_s, dist_bwn_normalized_c, dist_normalized_s, dist_normalized_c, seed_S_log, cand_S_log, rel_scale], dim=-1)  # (B, S, N, 7)
 
 # Output dimension of _compute_relative_features
-_REL_FEATURE_DIM = 7  # dist + dist_bwn + dist_norm_s + dist_norm_c + seed_S_log + cand_S_log + rel_scale
+_REL_FEATURE_DIM = 12  # dist + dist_bwn + dist_norm_s + dist_norm_c + seed_S_log + cand_S_log + rel_scale
 
 
 class SimpleAttentionBlock(nn.Module):
@@ -182,25 +197,30 @@ class PeelerBackbone(nn.Module):
         self.feat_dim = feat_dim
         self.embed_dim = embed_dim
         self.attention_heads = attention_heads
+        self.num_blocks = attention_blocks
 
         # Project pose features (5D) to feat_dim
         self.proj = nn.Sequential(
-            nn.Linear(5, self.feat_dim * 2),
+            nn.Linear(6, self.feat_dim // 4),
+            nn.GELU(),
+            nn.Linear(self.feat_dim // 4, self.feat_dim * 2),
             nn.GELU(),
             nn.Linear(self.feat_dim * 2, self.feat_dim)
         )
+
+        self.bias_count = self.attention_heads * self.num_blocks
 
         # Pairwise relational bias generator: 7 features → per-head bias
         self.rel_bias_generator = nn.Sequential(
             nn.Linear(_REL_FEATURE_DIM, 64),
             nn.GELU(),
-            nn.Linear(64, 64),
+            nn.Linear(64, 32),
             nn.GELU(),
-            nn.Linear(64, 64),
+            nn.Linear(32, 32),
             nn.GELU(),
-            nn.Linear(64, 16),
+            nn.Linear(32, 32),
             nn.GELU(),
-            nn.Linear(16, self.attention_heads)
+            nn.Linear(32, self.bias_count)
         )
 
         self.blocks = nn.ModuleList([
@@ -229,16 +249,19 @@ class PeelerBackbone(nn.Module):
         bbox_center = (min_translation + max_translation) / 2
 
         # Relative position from bbox center
-        relative_translation = translation - bbox_center
+        relative_translation = translation - torch.mean(translation)
         distance = torch.norm(relative_translation, dim=-1, keepdim=True)
 
+        norm_dist = torch.log10(torch.clamp(distance / scale, min=1e-8)) / 7
+
+        print(torch.max(norm_dist), " - ", torch.min(norm_dist))
+
         dir = torch.where(distance > 1e-8, relative_translation / distance, torch.zeros_like(relative_translation))
-        distance = (torch.log10(distance+1e-8) - 0.5) / 1.5
-        norm_scale = (torch.log10(scale)+2)/6
-        # print(torch.max(norm_scale), " - ", torch.min(norm_scale))
+        distance = (torch.log10(torch.clamp(distance, min=1e-3)) + 3) / 4
+        norm_scale = (torch.log10(scale)) / 6
 
         # Pose features: [relative_xyz(3) + scale(1) + distance(1)] = 5D
-        pose_features = torch.cat([dir, norm_scale, distance], dim=-1)  # (B, N, 5)
+        pose_features = torch.cat([dir, norm_scale, distance, norm_dist], dim=-1)  # (B, N, 5)
 
         # Project pose features to feat_dim
         x = self.proj(pose_features)  # (B, N, 5) → (B, N, feat_dim)
@@ -255,17 +278,18 @@ class PeelerBackbone(nn.Module):
         # 7D pairwise relational tensor: (B, N, N, 7)
         pairwise_feats = _compute_relative_features(seed_T, seed_S, cand_T, cand_S)
 
-        # Generate the Relational Attention Bias Map: [B, N, N, 7] → [B, H, N, N]
-        spatial_bias = self.rel_bias_generator(pairwise_feats)  # (B, N, N, H)
-        spatial_bias = spatial_bias.permute(0, 3, 1, 2)  # (B, H, N, N)
+        # Generate the Relational Attention Bias Map: [B, N, N, 7] → [B, H*L, N, N]
+        spatial_bias = self.rel_bias_generator(pairwise_feats)  # (B, N, N, H*L)
+        spatial_bias = spatial_bias.permute(0, 3, 1, 2)  # (B, H*L, N, N)
+        spatial_bias = spatial_bias.chunk(self.num_blocks, dim=1)  # [L] each (B, H, N, N)
 
         # Add mask bias so padded positions don't attend
         mask_bias = (1 - mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(1) * -1e9  # (B, 1, N, N)
-        spatial_bias = spatial_bias + mask_bias
 
         # Run Attention Blocks with explicit relational context
-        for block in self.blocks:
-            x = block(x, spatial_bias=spatial_bias)
+        for i, block in enumerate(self.blocks):
+            block_bias = spatial_bias[i] + mask_bias
+            x = block(x, spatial_bias=block_bias)
 
         return self.norm(x)  # (B, N, feat_dim)
 
@@ -291,13 +315,16 @@ class PeelerLoop(nn.Module):
         # High scores -> complex, identifiable parts (receiver, barrel)
         # Low scores -> simple, redundant parts (screws, noise)
         self.anchor_score_head = nn.Sequential(
-            nn.Linear(self.feat_dim, self.feat_dim * 2),
+            nn.Linear(self.feat_dim, self.feat_dim * 4),
             nn.GELU(),
             nn.Dropout(anchor_drop_rate),
-            nn.Linear(self.feat_dim * 2, self.feat_dim),
+            nn.Linear(self.feat_dim * 4, self.feat_dim),
             nn.GELU(),
             nn.Dropout(anchor_drop_rate),
-            nn.Linear(self.feat_dim, 1),
+            nn.Linear(self.feat_dim, self.feat_dim // 4),
+            nn.GELU(),
+            nn.Dropout(anchor_drop_rate),
+            nn.Linear(self.feat_dim // 4, 1),
         )
 
         # Relation head: project transformer output to small dim, concat with relative features
