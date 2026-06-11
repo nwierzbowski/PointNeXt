@@ -254,7 +254,7 @@ class PeelerBackbone(nn.Module):
 
         norm_dist = torch.log10(torch.clamp(distance / scale, min=1e-8)) / 7
 
-        print(torch.max(norm_dist), " - ", torch.min(norm_dist))
+        # print(torch.max(norm_dist), " - ", torch.min(norm_dist))
 
         dir = torch.where(distance > 1e-8, relative_translation / distance, torch.zeros_like(relative_translation))
         distance = (torch.log10(torch.clamp(distance, min=1e-3)) + 3) / 4
