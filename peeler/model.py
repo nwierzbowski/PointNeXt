@@ -46,14 +46,21 @@ def _transforms_to_pose(transforms):
     scale = torch.clamp(scale, min=1e-8)
     rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
 
+    min_trans = torch.amin(translation, dim=1, keepdim=True)
+    max_trans = torch.amax(translation, dim=1, keepdim=True)
+
+    center = (min_trans + max_trans) / 2
+
+    relative_translation = translation - center
+
     # Normalize by average distance per batch
-    avg_distance = torch.norm(translation, dim=-1).mean(dim=1, keepdim=True)  # (B, 1)
+    avg_distance = torch.norm(relative_translation, dim=-1).mean(dim=1, keepdim=True)  # (B, 1)
     avg_distance = torch.clamp(avg_distance, min=1e-8)
     avg_distance = avg_distance.unsqueeze(-1)  # (B, 1, 1)
-    translation = translation / avg_distance
+    relative_translation = relative_translation / avg_distance
     scale = scale / avg_distance
 
-    return translation, scale, rot
+    return relative_translation, scale, rot
 
 def _compute_relative_features(seed_T, seed_S, cand_T, cand_S):
     """Compute relative features between seed and candidate poses.
@@ -243,20 +250,14 @@ class PeelerBackbone(nn.Module):
         # Extract raw translation and scale
         translation, scale, _ = _transforms_to_pose(transforms)
 
-        # Bounding box center of translations
-        min_translation = translation.amin(dim=1, keepdim=True)
-        max_translation = translation.amax(dim=1, keepdim=True)
-        bbox_center = (min_translation + max_translation) / 2
-
         # Relative position from bbox center
-        relative_translation = translation - torch.mean(translation)
-        distance = torch.norm(relative_translation, dim=-1, keepdim=True)
+        distance = torch.norm(translation, dim=-1, keepdim=True)
 
         norm_dist = torch.log10(torch.clamp(distance / scale, min=1e-8)) / 7
 
         # print(torch.max(norm_dist), " - ", torch.min(norm_dist))
 
-        dir = torch.where(distance > 1e-8, relative_translation / distance, torch.zeros_like(relative_translation))
+        dir = torch.where(distance > 1e-8, translation / distance, torch.zeros_like(translation))
         distance = (torch.log10(torch.clamp(distance, min=1e-3)) + 3) / 4
         norm_scale = (torch.log10(scale)) / 6
 
