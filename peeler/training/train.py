@@ -160,7 +160,7 @@ def _train(
                 model_name = type(model).__name__
                 if model_name == 'PurelyRelationalPeeler':
                     Y = batch['Y'].to(device, dtype=torch.float32, non_blocking=True)
-                    affinity_logits = model(transforms, mask)
+                    affinity_logits = model(embeddings, transforms, mask)
                     loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
                 else:
                     refined_emb = model(embeddings, transforms, mask)

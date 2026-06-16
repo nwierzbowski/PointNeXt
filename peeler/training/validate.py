@@ -228,7 +228,7 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
 
             model_name = type(model).__name__
             if model_name == 'PurelyRelationalPeeler':
-                affinity_logits = model(transforms, mask)
+                affinity_logits = model(embeddings, transforms, mask)
                 loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
 
                 # F1 on pairwise affinity

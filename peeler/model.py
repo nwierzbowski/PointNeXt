@@ -217,7 +217,7 @@ class PurelyRelationalBlock(nn.Module):
         return highway + result
 
 
-
+_PAIRWISE_DIM = 42
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
@@ -225,11 +225,12 @@ class PurelyRelationalPeeler(nn.Module):
 
     Architecture:
         1. Compute 22D relative features from transforms
-        2. Project to 64D relational space
-        3. Stack of purely relational triangular update blocks with bottleneck
-        4. Project to 1-channel affinity logits
+        2. Compute 4D pairwise features from embeddings
+        3. Concat features (26D) and project to 64D relational space
+        4. Stack of purely relational triangular update blocks with bottleneck
+        5. Project to 1-channel affinity logits
 
-    Input: transforms(B,N,16), mask(B,N)
+    Input: embeddings(B,N,256), transforms(B,N,16), mask(B,N)
     Output: affinity_logits(B,N,N)
 
     Training: BCE loss on same-asset affinity matrix.
@@ -241,8 +242,13 @@ class PurelyRelationalPeeler(nn.Module):
         self.downsample_schedule = list(downsample_schedule)
         self.num_blocks = len(self.downsample_schedule)
         self.highway_dim = 64
+        self.pairwise_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Linear(128, _PAIRWISE_DIM),
+        )
         self.input_proj = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM, 128),
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 128),
             nn.GELU(),
             nn.Linear(128, 64),
             nn.GELU(),
@@ -257,15 +263,16 @@ class PurelyRelationalPeeler(nn.Module):
             for target_dim in self.downsample_schedule
         ])
         self.output_head = nn.Sequential(
-            nn.Linear(self.highway_dim, 16),
+            nn.Linear(self.highway_dim, 64),
             nn.GELU(),
-            nn.Linear(16, 1)
+            nn.Linear(64, 1)
         )
 
-    def forward(self, transforms, mask):
+    def forward(self, embeddings, transforms, mask):
         """Forward pass.
 
         Args:
+            embeddings: (B, N, 256) - fragment embeddings from backbone
             transforms: (B, N, 16) - fragment transforms (4x4 pose matrices flattened)
             mask: (B, N) - 1 for real fragments, 0 for padding
 
@@ -274,12 +281,21 @@ class PurelyRelationalPeeler(nn.Module):
         """
         B, N, _ = transforms.shape
         translation, scale, rot = transforms_to_pose(transforms, mask)
-        pairwise_feats = compute_relative_features(
+        rel_feats = compute_relative_features(
             translation, scale.view(B, N),
             translation, scale.squeeze(-1),
             rot, rot
         )
-        e = self.input_proj(pairwise_feats)
+        # Pairwise from embeddings: |e_i - e_j| and e_i * e_j
+        emb_i = embeddings.unsqueeze(1)  # (B, 1, N, 256)
+        emb_j = embeddings.unsqueeze(2)  # (B, N, 1, 256)
+        abs_diff = torch.abs(emb_i - emb_j)  # (B, N, N, 256)
+        prod = emb_i * emb_j  # (B, N, N, 256)
+        pairwise_feats = torch.cat([abs_diff, prod], dim=-1)  # (B, N, N, 512)
+        pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
+        # Concat relative features + pairwise features
+        combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
+        e = self.input_proj(combined)
         for block in self.blocks:
             e = block(e, mask)
         affinity_logits = self.output_head(e).squeeze(-1)

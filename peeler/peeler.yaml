@@ -1,11 +1,11 @@
-batch_size: 16
+batch_size: 4
 criterion:
   NAME: BCEAffinityPeelerLoss
 dataset:
   asset_scale_std:
   - -1.0
   - 1.0
-  max_asset_fragments: 60
+  max_asset_fragments: 50
   max_assets_per_soup: 12
   min_assets_per_soup: 1
   scene_scale:
@@ -15,17 +15,21 @@ dataset:
   translation_scale:
   - -2.0
   - 1.9
-embedding_noise_sigma: 0.0
+embedding_noise_sigma: 0.001
 epochs: 40
-lr: 0.006
+lr: 0.004
 lr_pct_start: 0.1
 model:
   NAME: PurelyRelationalPeeler
   downsample_schedule:
-  - 8
-  - 8
-  - 8
-  - 8
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
 optimizer:
   NAME: adamw
   weight_decay: 0.01
