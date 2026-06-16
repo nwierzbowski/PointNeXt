@@ -1,19 +1,17 @@
 """Peeler - Adaptive Object Peeler for 3D fragment grouping.
 
 Submodules:
-    model: PeelerBackbone, PeelerLoop, Peeler
+    model: Peeler
     dataset: PeelerDataset
-    loss: PeelerLoss
+    loss: AlignedPullPushPeelerLoss
     training: setup and train pipeline
 """
-from peeler.model import PeelerBackbone, PeelerLoop, Peeler
+from peeler.model import Peeler
 from peeler.dataset import PeelerDataset
-from peeler.loss import PeelerLoss
+from peeler.loss import AlignedPullPushPeelerLoss
 
 __all__ = [
-    'PeelerBackbone',
-    'PeelerLoop',
     'Peeler',
     'PeelerDataset',
-    'PeelerLoss',
+    'AlignedPullPushPeelerLoss',
 ]

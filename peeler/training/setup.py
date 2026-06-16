@@ -97,7 +97,7 @@ def setup(
         test_transforms: list of numpy arrays (N_i, 16), one per test asset
 
     Returns:
-        (model, train_loader, val_loader, optimizer, scheduler, scaler, start_epoch, device, num_epochs)
+        (model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device, num_epochs)
     """
     # Load config
     if yaml_content is not None:
@@ -113,6 +113,7 @@ def setup(
         log_callback(f'Device: {device}')
 
     num_epochs = cfg.epochs
+
     batch_size = cfg.batch_size
 
     # Build train dataset
@@ -174,18 +175,19 @@ def setup(
     else:
         raise ValueError(f'Unknown optimizer: {optimizer_cfg.NAME}')
 
-    # Build scheduler
-    oc = cfg.onecycle if hasattr(cfg, 'onecycle') else {}
-    total_steps = num_epochs * len(train_loader)
+    # Build scheduler (OneCycleLR with warmup + cosine decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=cfg.lr,
-        total_steps=total_steps,
-        pct_start=oc.get('pct_start', 0.3),
-        anneal_strategy=oc.get('anneal_strategy', 'cos'),
-        div_factor=oc.get('div_factor', 25),
-        final_div_factor=oc.get('final_div_factor', 1e4),
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=cfg.lr_pct_start,
+        anneal_strategy='cos',
+        cycle_momentum=False,
     )
+
+    # Attach num_epochs to criterion (used by loss.py for curriculum ramp)
+    criterion._num_epochs = num_epochs
 
     # AMP scaler
     use_amp = device.type == 'cuda'
@@ -202,4 +204,4 @@ def setup(
         if start_epoch > 0 and log_callback:
             log_callback(f'Resuming training from epoch {start_epoch}')
 
-    return model, train_loader, val_loader, optimizer, scheduler, scaler, start_epoch, device, num_epochs
+    return model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device, num_epochs

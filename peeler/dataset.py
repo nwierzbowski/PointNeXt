@@ -165,6 +165,7 @@ class PeelerDataset(Dataset):
             'transforms': torch.from_numpy(soup_trans),
             'Y': torch.from_numpy(Y),
             'orig_indices': torch.from_numpy(orig_indices),
+            'asset_ids': torch.from_numpy(asset_ids),
             'soup_count': k,
         }
 
@@ -180,6 +181,7 @@ class PeelerDataset(Dataset):
         transforms_list = []
         Y_list = []
         orig_indices_list = []
+        asset_ids_list = []
         mask_list = []
 
         # Pre-create a flat identity matrix for padding [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
@@ -224,17 +226,25 @@ class PeelerDataset(Dataset):
                         torch.full((pad_size,), -999, dtype=torch.int64),
                     ], dim=0)
                 )
+                asset_ids_list.append(
+                    torch.cat([
+                        d['asset_ids'],
+                        torch.full((pad_size,), -1, dtype=torch.int64),
+                    ], dim=0)
+                )
             else:
                 embeddings_list.append(d['embeddings'])
                 transforms_list.append(d['transforms'])
                 Y_list.append(d['Y'])
                 orig_indices_list.append(d['orig_indices'])
+                asset_ids_list.append(d['asset_ids'])
 
         return {
             'embeddings': torch.stack(embeddings_list),
             'transforms': torch.stack(transforms_list),
             'Y': torch.stack(Y_list),
             'orig_indices': torch.stack(orig_indices_list),
+            'asset_ids': torch.stack(asset_ids_list),
             'mask': torch.stack(mask_list), # [B, N]
             'soup_count': torch.tensor([d['soup_count'] for d in datas], dtype=torch.float32),
         }
