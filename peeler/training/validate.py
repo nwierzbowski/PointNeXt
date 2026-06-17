@@ -41,10 +41,8 @@ def _gt_connected_components(Y, mask):
     return labels
 
 
-def _ari_nmi_batch(labels_true, labels_pred, mask):
-    """Compute ARI and NMI for a batch of label assignments.
-
-    Vectorized operations using numpy for speed.
+def _ari_batch(labels_true, labels_pred, mask):
+    """Compute ARI for a batch of label assignments.
 
     Args:
         labels_true: (B, N) - ground truth cluster labels
@@ -53,11 +51,9 @@ def _ari_nmi_batch(labels_true, labels_pred, mask):
 
     Returns:
         ari_sum: sum of ARI scores
-        nmi_sum: sum of NMI scores
         batch_count: number of samples with >= 2 valid fragments
     """
     ari_sum = 0.0
-    nmi_sum = 0.0
     batch_count = 0
 
     B, N = labels_true.shape
@@ -72,7 +68,6 @@ def _ari_nmi_batch(labels_true, labels_pred, mask):
         if len(gt_valid) < 2:
             continue
 
-        # Build contingency table using numpy histogram2d
         unique_gt = np.unique(gt_valid)
         unique_pred = np.unique(pred_valid)
         contingency = np.zeros((len(unique_gt), len(unique_pred)), dtype=np.int64)
@@ -83,7 +78,6 @@ def _ari_nmi_batch(labels_true, labels_pred, mask):
         for i in range(len(gt_valid)):
             contingency[gt_idx[i], pred_idx[i]] += 1
 
-        # ARI
         n = len(gt_valid)
         sum_comb_ij = (contingency * (contingency - 1)).sum() / 2
         a = contingency.sum(axis=1)
@@ -100,41 +94,10 @@ def _ari_nmi_batch(labels_true, labels_pred, mask):
         else:
             ari = (sum_comb_ij - expected) / denom
 
-        # NMI
-        row_sum = contingency.sum(axis=1)
-        col_sum = contingency.sum(axis=0)
-        total = contingency.sum()
-
-        mi = 0.0
-        for i in range(len(unique_gt)):
-            for j in range(len(unique_pred)):
-                if contingency[i, j] > 0:
-                    p_ij = contingency[i, j] / total
-                    p_i = row_sum[i] / total
-                    p_j = col_sum[j] / total
-                    mi += p_ij * math.log(p_ij / (p_i * p_j))
-
-        def entropy(m):
-            h = 0.0
-            for v in m:
-                if v > 0:
-                    p = v / m.sum()
-                    h -= p * math.log(p)
-            return h
-
-        h_true = entropy(row_sum)
-        h_pred = entropy(col_sum)
-
-        if h_true == 0 or h_pred == 0:
-            nmi = 1.0 if len(unique_gt) == len(unique_pred) else 0.0
-        else:
-            nmi = mi / math.sqrt(h_true * h_pred)
-
         ari_sum += ari
-        nmi_sum += nmi
         batch_count += 1
 
-    return ari_sum, nmi_sum, batch_count
+    return ari_sum, batch_count
 
 
 def _f1_score_batch(Y_true, Y_pred, mask):
@@ -208,11 +171,10 @@ def _dbscan_embeddings(embeddings, mask, eps=0.5, min_samples=2):
 
 
 def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
-    """Run validation loop and return loss, ARI, and NMI."""
+    """Run validation loop and return loss, ARI, and F1."""
     model.eval()
     total_loss = 0.0
     ari_sum = 0.0
-    nmi_sum = 0.0
     batch_count = 0
     tp_sum = 0.0
     fp_sum = 0.0
@@ -249,10 +211,9 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
 
             gt_labels = _gt_connected_components(Y, mask)
 
-            # Compute ARI and NMI for the batch
-            ari, nmi, cnt = _ari_nmi_batch(gt_labels, pred_labels, mask)
+            # Compute ARI for the batch
+            ari, cnt = _ari_batch(gt_labels, pred_labels, mask)
             ari_sum += ari
-            nmi_sum += nmi
             batch_count += cnt
 
             total_loss += loss.item()
@@ -260,11 +221,10 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
     num_batches = max(len(val_loader), 1)
     avg_loss = total_loss / num_batches
     avg_ari = ari_sum / batch_count if batch_count > 0 else 0.0
-    avg_nmi = nmi_sum / batch_count if batch_count > 0 else 0.0
 
     # Compute F1 from accumulators
     precision = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else 0.0
     recall = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    return avg_loss, avg_ari, avg_nmi, f1
+    return avg_loss, avg_ari, 0.0, f1

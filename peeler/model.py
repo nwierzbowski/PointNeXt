@@ -168,6 +168,15 @@ class Peeler(nn.Module):
 
         return refined_emb
 
+class GeGLU(nn.Module):
+    """
+    ONNX-safe Gated Linear Unit with GELU activation.
+    Splits the last dimension in half and uses one half to gate the other.
+    """
+    def forward(self, x):
+        # chunk(2, dim=-1) splits the channel dimension into two equal tensors
+        x1, x2 = x.chunk(2, dim=-1)
+        return x1 * torch.nn.functional.gelu(x2)
 
 class PurelyRelationalBlock(nn.Module):
     """Bottleneck Purely Relational Block with fixed highway.
@@ -217,6 +226,29 @@ class PurelyRelationalBlock(nn.Module):
         return highway + result
 
 
+class MLPBlock(nn.Module):
+    """MLP residual block on pairwise feature tensor.
+
+    Projects down to target_dim, applies MLP, projects back up to highway_dim.
+    Element-wise operations on (B, N, N, D) with bottleneck architecture.
+    """
+
+    def __init__(self, highway_dim, target_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(highway_dim, target_dim),
+            nn.LayerNorm(target_dim),
+            nn.GELU(),
+            nn.Linear(target_dim, highway_dim)
+        )
+
+    def forward(self, e, mask):
+        result = self.mlp(e)
+        mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
+        result = result * mask_2d
+        return e + result
+
+
 _PAIRWISE_DIM = 42
 
 @MODELS.register_module()
@@ -226,8 +258,8 @@ class PurelyRelationalPeeler(nn.Module):
     Architecture:
         1. Compute 22D relative features from transforms
         2. Compute 4D pairwise features from embeddings
-        3. Concat features (26D) and project to 64D relational space
-        4. Stack of purely relational triangular update blocks with bottleneck
+        3. Concat features (26D) and project to highway_dim relational space
+        4. Stack of relational + MLP blocks with bottleneck
         5. Project to 1-channel affinity logits
 
     Input: embeddings(B,N,256), transforms(B,N,16), mask(B,N)
@@ -237,33 +269,30 @@ class PurelyRelationalPeeler(nn.Module):
     Inference: threshold + connected components for clustering.
     """
 
-    def __init__(self, downsample_schedule, **kwargs):
+    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, **kwargs):
         super().__init__()
         self.downsample_schedule = list(downsample_schedule)
         self.num_blocks = len(self.downsample_schedule)
-        self.highway_dim = 64
+        self.mlp_sizes = list(mlp_sizes)
         self.pairwise_head = nn.Sequential(
             nn.Linear(512, 128),
             nn.GELU(),
+            nn.Dropout(pairwise_dropout),
             nn.Linear(128, _PAIRWISE_DIM),
         )
         self.input_proj = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 128),
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.Linear(64, self.highway_dim)
+            nn.LayerNorm(_REL_FEATURE_DIM + _PAIRWISE_DIM),
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 256),
+            GeGLU(),
+            nn.Linear(128, highway_dim)
         )
-        self.blocks = nn.ModuleList([
-            PurelyRelationalBlock(self.highway_dim, target_dim)
-            for target_dim in self.downsample_schedule
-        ])
+        self.blocks = nn.ModuleList()
+        for i, target_dim in enumerate(self.downsample_schedule):
+            self.blocks.append(PurelyRelationalBlock(highway_dim, target_dim))
+            if self.mlp_sizes[i] > 0:
+                self.blocks.append(MLPBlock(highway_dim, target_dim))
         self.output_head = nn.Sequential(
-            nn.Linear(self.highway_dim, 64),
+            nn.Linear(highway_dim, 64),
             nn.GELU(),
             nn.Linear(64, 1)
         )
