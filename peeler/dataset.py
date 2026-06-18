@@ -80,7 +80,14 @@ class PeelerDataset(Dataset):
 
     def __len__(self):
         return self.n_assets
-
+    
+    def get_exponential_weights(self, min_val, max_val, decay):
+        x = np.arange(min_val, max_val + 1)
+        # Compute raw exponential weights
+        raw_weights = np.exp(-decay * x)
+        # Normalize to sum to exactly 1.0
+        return raw_weights / raw_weights.sum()
+    
     def __getitem__(self, idx):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
@@ -88,7 +95,18 @@ class PeelerDataset(Dataset):
         # Sample K assets with random size in [min, max]
         upper = min(self.max_assets_per_soup, self.n_assets)
         lower = min(self.min_assets_per_soup, upper)
-        k = rng.randint(lower, upper + 1)  # uniform [lower, upper]
+        
+        # 1. Generate the possible choices of K (e.g., [1, 2, 3, ..., 12])
+        choices = np.arange(lower, upper + 1)
+        
+        # 2. Get the exponential decay probabilities specifically for this valid range [1]
+        probs = self.get_exponential_weights(lower, upper, 0.35)
+        
+        # 3. Sample a single integer K using the decay probabilities [1]
+        # rng.choice will select exactly 1 integer according to your skewed weights
+        k = int(rng.choice(choices, p=probs))  # Cast to standard python int for safety
+        
+        # Now k is a clean, single integer (e.g., 1, 2, or 3) weighted toward the low end!
         asset_indices = list(rng.choice(self.n_assets, size=k, replace=False))
 
         # Combine all fragments from selected assets
