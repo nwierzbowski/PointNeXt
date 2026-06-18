@@ -1,9 +1,11 @@
 """Validation functions for peeler training."""
-import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 
 def _gt_connected_components(Y, mask):
@@ -21,7 +23,6 @@ def _gt_connected_components(Y, mask):
     B, N, _ = Y.shape
     device = Y.device
 
-    # Y should be boolean or thresholded
     adj = Y > 0.5
     pad_mask = (mask.unsqueeze(2) * mask.unsqueeze(1)).bool()
     valid_adj = adj & pad_mask
@@ -39,6 +40,31 @@ def _gt_connected_components(Y, mask):
         labels = new_labels
 
     return labels
+
+
+def _cluster_with_average_linkage(affinity_matrix, threshold=0.5):
+    """Average-Linkage clustering on affinity matrix.
+
+    Args:
+        affinity_matrix: (N, N) numpy array - sigmoid-activated affinities [0, 1]
+        threshold: distance threshold [0.0, 1.0]. 0.5 = standard baseline.
+
+    Returns:
+        labels: (N,) numpy array - cluster assignments (1-based integers)
+    """
+    N = affinity_matrix.shape[0]
+    if N <= 1:
+        return np.zeros(N, dtype=np.int32)
+
+    distance_matrix = 1.0 - affinity_matrix
+    distance_matrix = 0.5 * (distance_matrix + distance_matrix.T)
+    np.fill_diagonal(distance_matrix, 0.0)
+
+    condensed_dist = squareform(distance_matrix)
+    Z = linkage(condensed_dist, method='average')
+    pred_groups = fcluster(Z, t=threshold, criterion='distance')
+
+    return pred_groups
 
 
 def _ari_batch(labels_true, labels_pred, mask):
@@ -135,8 +161,6 @@ def _f1_score_batch(Y_true, Y_pred, mask):
 def _dbscan_embeddings(embeddings, mask, eps=0.5, min_samples=2):
     """Run DBSCAN on refined embeddings per batch item using sklearn.
 
-    Matches the Rust inference DBSCAN parameters (eps=0.5, min_samples=2).
-
     Args:
         embeddings: (B, N, D) - refined embeddings (on GPU)
         mask: (B, N) - 1 for valid fragments, 0 for padding
@@ -149,7 +173,6 @@ def _dbscan_embeddings(embeddings, mask, eps=0.5, min_samples=2):
     B, N, D = embeddings.shape
     labels = torch.full((B, N), -1, dtype=torch.long, device=embeddings.device)
 
-    # Move to CPU for sklearn
     emb_np = embeddings.detach().cpu().numpy()
     mask_np = mask.detach().cpu().numpy()
 
@@ -159,29 +182,33 @@ def _dbscan_embeddings(embeddings, mask, eps=0.5, min_samples=2):
         if len(valid_indices) < min_samples:
             continue
 
-        points = emb_np[b, valid_indices]  # (num_valid, D)
+        points = emb_np[b, valid_indices]
         db = DBSCAN(eps=eps, min_samples=min_samples).fit(points)
-        cluster_labels = db.labels_  # -1 for noise, 0+ for clusters
+        cluster_labels = db.labels_
 
-        # Map back to full N-sized array
         for idx, local_idx in enumerate(valid_indices):
             labels[b, local_idx] = torch.tensor(cluster_labels[idx], dtype=torch.long, device=embeddings.device)
 
     return labels
 
 
-def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
-    """Run validation loop and return loss, ARI, and F1."""
+def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs, threshold=0.5):
+    """Run validation loop with Average-Linkage clustering.
+
+    Returns:
+        (loss, ari, nmi, f1)
+    """
     model.eval()
     total_loss = 0.0
     ari_sum = 0.0
+    nmi_sum = 0.0
     batch_count = 0
     tp_sum = 0.0
     fp_sum = 0.0
     fn_sum = 0.0
 
     with torch.no_grad():
-        for (batch_idx, batch) in enumerate(val_loader):
+        for batch_idx, batch in enumerate(val_loader):
             embeddings = batch['embeddings'].to(device)
             transforms = batch['transforms'].to(device)
             mask = batch['mask'].to(device)
@@ -193,38 +220,60 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs):
                 affinity_logits = model(embeddings, transforms, mask)
                 loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
 
-                # F1 on pairwise affinity
+                # F1 on raw thresholded adjacency
                 pred_adj = (torch.sigmoid(affinity_logits) > 0.5).float()
                 tp, fp, fn = _f1_score_batch(Y, pred_adj, mask)
                 tp_sum += tp
                 fp_sum += fp
                 fn_sum += fn
 
-                # Connected components for clustering metrics
-                pred_labels = _gt_connected_components(pred_adj, mask)
+                # Average-Linkage clustering for cluster-level metrics
+                soft_A = torch.sigmoid(affinity_logits).cpu().numpy()
+                mask_np = mask.cpu().numpy()
+                Y_np = Y.cpu().numpy()
+
+                B = soft_A.shape[0]
+                for b in range(B):
+                    active_indices = np.where(mask_np[b] > 0.5)[0]
+                    if len(active_indices) < 2:
+                        continue
+
+                    b_affinities = soft_A[b][active_indices][:, active_indices]
+                    b_gt_matrix = Y_np[b][active_indices][:, active_indices]
+
+                    # Ground-truth labels from Y matrix
+                    gt_labels = _gt_connected_components(
+                        torch.from_numpy(b_gt_matrix).unsqueeze(0).float().to(device),
+                        torch.from_numpy((mask_np[b][active_indices] > 0.5).astype(np.float32)).unsqueeze(0).to(device)
+                    )
+                    gt_labels = gt_labels[0, :len(active_indices)].cpu().numpy()
+
+                    # Predicted labels via Average-Linkage
+                    pred_labels = _cluster_with_average_linkage(b_affinities, threshold=threshold)
+
+                    ari_sum += adjusted_rand_score(gt_labels, pred_labels)
+                    nmi_sum += normalized_mutual_info_score(gt_labels, pred_labels)
+                    batch_count += 1
             else:
                 refined_emb = model(embeddings, transforms, mask)
                 loss, loss_dict = criterion(refined_emb, asset_ids, mask, epoch, num_epochs)
 
-                # DBSCAN evaluation on refined embeddings (matches Rust inference)
                 pred_labels = _dbscan_embeddings(refined_emb, mask, eps=0.5, min_samples=2)
+                gt_labels = _gt_connected_components(Y, mask)
 
-            gt_labels = _gt_connected_components(Y, mask)
-
-            # Compute ARI for the batch
-            ari, cnt = _ari_batch(gt_labels, pred_labels, mask)
-            ari_sum += ari
-            batch_count += cnt
+                ari_batch, cnt_batch = _ari_batch(gt_labels, pred_labels, mask)
+                ari_sum += ari_batch
+                batch_count += cnt_batch
 
             total_loss += loss.item()
 
     num_batches = max(len(val_loader), 1)
     avg_loss = total_loss / num_batches
     avg_ari = ari_sum / batch_count if batch_count > 0 else 0.0
+    avg_nmi = nmi_sum / batch_count if batch_count > 0 else 0.0
 
-    # Compute F1 from accumulators
     precision = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else 0.0
     recall = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    return avg_loss, avg_ari, 0.0, f1
+    return avg_loss, avg_ari, avg_nmi, f1

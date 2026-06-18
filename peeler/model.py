@@ -176,7 +176,7 @@ class GeGLU(nn.Module):
     def forward(self, x):
         # chunk(2, dim=-1) splits the channel dimension into two equal tensors
         x1, x2 = x.chunk(2, dim=-1)
-        return x1 * torch.nn.functional.gelu(x2)
+        return x1 * torch.nn.functional.silu(x2)
 
 class PurelyRelationalBlock(nn.Module):
     """Bottleneck Purely Relational Block with fixed highway.
@@ -192,21 +192,20 @@ class PurelyRelationalBlock(nn.Module):
         super().__init__()
         
         self.left_proj = nn.Sequential(
-            nn.Linear(highway_dim, target_dim),
-            nn.LayerNorm(target_dim),
-            nn.GELU(),
-            nn.Linear(target_dim, target_dim)
+            nn.Linear(highway_dim, target_dim * 2),
+            nn.LayerNorm(target_dim * 2),
+            GeGLU(),
         )
         self.right_proj = nn.Sequential(
-            nn.Linear(highway_dim, target_dim),
-            nn.LayerNorm(target_dim),
-            nn.GELU(),
-            nn.Linear(target_dim, target_dim)
+            nn.Linear(highway_dim, target_dim * 2),
+            nn.LayerNorm(target_dim * 2),
+            GeGLU(),
         )
         self.proj_up = nn.Sequential(
+            nn.LayerNorm(target_dim),
             nn.Linear(target_dim, target_dim * 4),
-            nn.GELU(),
-            nn.Linear(target_dim * 4, highway_dim)
+            GeGLU(),
+            nn.Linear(target_dim * 2, highway_dim)
         )
 
     def forward(self, e, mask):
@@ -236,9 +235,9 @@ class MLPBlock(nn.Module):
     def __init__(self, highway_dim, target_dim):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(highway_dim, target_dim),
-            nn.LayerNorm(target_dim),
-            nn.GELU(),
+            nn.Linear(highway_dim, target_dim * 2),
+            nn.LayerNorm(target_dim * 2),
+            GeGLU(),
             nn.Linear(target_dim, highway_dim)
         )
 
@@ -275,16 +274,16 @@ class PurelyRelationalPeeler(nn.Module):
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.pairwise_head = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.GELU(),
+            nn.Linear(512, 256),
+            GeGLU(),
             nn.Dropout(pairwise_dropout),
             nn.Linear(128, _PAIRWISE_DIM),
         )
         self.input_proj = nn.Sequential(
             nn.LayerNorm(_REL_FEATURE_DIM + _PAIRWISE_DIM),
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 256),
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 512),
             GeGLU(),
-            nn.Linear(128, highway_dim)
+            nn.Linear(256, highway_dim)
         )
         self.blocks = nn.ModuleList()
         for i, target_dim in enumerate(self.downsample_schedule):
@@ -292,8 +291,8 @@ class PurelyRelationalPeeler(nn.Module):
             if self.mlp_sizes[i] > 0:
                 self.blocks.append(MLPBlock(highway_dim, target_dim))
         self.output_head = nn.Sequential(
-            nn.Linear(highway_dim, 64),
-            nn.GELU(),
+            nn.Linear(highway_dim, 128),
+            GeGLU(),
             nn.Linear(64, 1)
         )
 

@@ -75,6 +75,7 @@ def peeler_train(
     ema_alpha = cfg['training']['ema_alpha']
     best_metric = 'ari'
     embedding_noise_sigma = cfg['embedding_noise_sigma']
+    validation_threshold = cfg.get('validation', {}).get('threshold', 0.5)
 
     # 4. Internal train() — called with all config loaded
     return _train(
@@ -88,6 +89,7 @@ def peeler_train(
         ema_alpha=ema_alpha,
         best_metric=best_metric,
         embedding_noise_sigma=embedding_noise_sigma,
+        validation_threshold=validation_threshold,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -128,6 +130,7 @@ def _train(
     ema_alpha=0.1,
     best_metric='ari',
     embedding_noise_sigma=0.0,
+    validation_threshold=0.5,
 ):
     """Run the training epoch loop."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
@@ -221,7 +224,9 @@ def _train(
         val_nmi = 0.0
         val_f1 = 0.0
         if val_loader is not None:
-            val_loss, val_ari, val_nmi, val_f1 = validate(model, val_loader, criterion, device, scaler, epoch, num_epochs)
+            val_loss, val_ari, val_nmi, val_f1 = validate(
+                model, val_loader, criterion, device, scaler, epoch, num_epochs, threshold=validation_threshold
+            )
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']

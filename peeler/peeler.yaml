@@ -5,7 +5,7 @@ dataset:
   asset_scale_std:
   - -1.0
   - 1.0
-  max_asset_fragments: 50
+  max_asset_fragments: 45
   max_assets_per_soup: 12
   min_assets_per_soup: 1
   scene_scale:
@@ -17,7 +17,7 @@ dataset:
   - 1.9
 embedding_noise_sigma: 0.004
 epochs: 40
-lr: 0.004
+lr: 0.003
 lr_pct_start: 0.1
 model:
   NAME: PurelyRelationalPeeler
@@ -32,19 +32,24 @@ model:
   - 16
   highway_dim: 64
   mlp_sizes:
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  pairwise_dropout: 0.2
+  - 176
+  - 176
+  - 176
+  - 176
+  - 176
+  - 176
+  - 176
+  - 176
+  pairwise_dropout: 0.0
 optimizer:
   NAME: adamw
-  weight_decay: 0.01
+  weight_decay: 0.035
+scheduler:
+  div: 10.0
+  final_div_factor: 10000.0
 training:
   device: cuda
   ema_alpha: 0.1
   report_interval: 40000
+validation:
+  threshold: 0.5

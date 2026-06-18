@@ -158,24 +158,39 @@ def setup(
     # Build criterion
     criterion = build_criterion_from_cfg(cfg.criterion)
 
-    # Build optimizer
+    # Build optimizer with parameter grouping
+    # Exclude biases and LayerNorm parameters from weight decay
     optimizer_cfg = cfg.optimizer
+    weight_decay = optimizer_cfg.get('weight_decay', 0.01)
+
+    no_decay_weight_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
+
+    param_groups = [
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay_weight_decay) and p.requires_grad
+            ],
+            "weight_decay": weight_decay,
+        },
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay_weight_decay) and p.requires_grad
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
     if optimizer_cfg.NAME == 'adamw':
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=optimizer_cfg.get('weight_decay', 0.01),
-        )
+        optimizer = torch.optim.AdamW(param_groups, lr=cfg.lr)
     elif optimizer_cfg.NAME == 'adam':
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=optimizer_cfg.get('weight_decay', 0.0),
-        )
+        optimizer = torch.optim.Adam(param_groups, lr=cfg.lr)
     else:
         raise ValueError(f'Unknown optimizer: {optimizer_cfg.NAME}')
 
     # Build scheduler (OneCycleLR with warmup + cosine decay)
+    scheduler_cfg = cfg.get('scheduler', {})
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=cfg.lr,
@@ -184,6 +199,8 @@ def setup(
         pct_start=cfg.lr_pct_start,
         anneal_strategy='cos',
         cycle_momentum=False,
+        div_factor=scheduler_cfg.get('div', 25.0),
+        final_div_factor=scheduler_cfg.get('final_div_factor', 10000.0),
     )
 
     # Attach num_epochs to criterion (used by loss.py for curriculum ramp)
