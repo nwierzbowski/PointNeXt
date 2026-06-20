@@ -22,7 +22,7 @@ TRANSFORM_DIM = 6
 _REL_FEATURE_DIM = 22
 
 
-def transforms_to_pose(transforms, mask=None):
+def transforms_to_pose(transforms, mask):
     """Extract translation, scale, and normalized rotation from 4x4 transforms.
 
     Args:
@@ -41,17 +41,29 @@ def transforms_to_pose(transforms, mask=None):
     scale = torch.clamp(scale, min=1e-8)
     rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
 
-    min_trans = torch.amin(translation, dim=1, keepdim=True)
-    max_trans = torch.amax(translation, dim=1, keepdim=True)
+    mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
+    num_active = mask_expanded.sum(dim=1, keepdim=True)  # (B, 1, 1)
 
-    center = (min_trans + max_trans) / 2
+    active_translation = translation * mask_expanded
+    center = active_translation.sum(dim=1, keepdim=True) / (num_active + 1e-8)
 
-    relative_translation = translation - center
+    relative_translation = (translation - center) * mask_expanded
 
     # Normalize by average distance per batch
-    avg_distance = torch.norm(relative_translation, dim=-1).mean(dim=1, keepdim=True)  # (B, 1)
-    avg_distance = torch.clamp(avg_distance, min=1e-8)
-    avg_distance = avg_distance.unsqueeze(-1)  # (B, 1, 1)
+    active_scales_sum = (scale * mask_expanded).sum(dim=1, keepdim=True)  # (B, 1, 1)
+    avg_distance = active_scales_sum / (num_active + 1e-8)  # (B, 1, 1)
+
+    # active_distance_sum = torch.sum(torch.norm(relative_translation, dim=-1), dim=-1)
+    # avg_distance = active_distance_sum / (num_active.squeeze() + 1e-8)  # (B,) / (B,) = (B,)
+    # avg_distance = torch.clamp(avg_distance, min=1e-8)
+    # avg_distance = avg_distance.view(B, 1, 1)  # (B, 1, 1)
+
+    # Break degeneracy: when all positions are identical, add small deterministic
+    # per-fragment perturbation based on fragment index. ONNX-compatible (no randomness).
+    indices = torch.arange(N, device=transforms.device, dtype=torch.float32)
+    perturbation = torch.sin(indices.unsqueeze(-1) * 0.1) * 1e-4  # (N, 3)
+    relative_translation = relative_translation + perturbation.unsqueeze(0)  # broadcast to (B, N, 3)
+    
     relative_translation = relative_translation / avg_distance
     scale = scale / avg_distance
 
@@ -84,16 +96,41 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
         seed_S: (B, S) f32 - seed scales
         cand_T: (B, N, 3) f32 - candidate translations
         cand_S: (B, N) f32 - candidate scales
-        seed_rot: (B, S, 9) f32 - seed rotation matrices (optional)
-        cand_rot: (B, N, 9) f32 - candidate rotation matrices (optional)
+        seed_rot: (B, S, 9) f32 - seed rotation matrices (flattened)
+        cand_rot: (B, N, 9) f32 - candidate rotation matrices (flattened)
 
     Returns:
         rel_features: (B, S, N, 22) f32 - includes rotation features
     """
+    B, S, _ = seed_T.shape
+    _, N, _ = cand_T.shape
+    device = seed_T.device
+
     diff = cand_T.unsqueeze(1) - seed_T.unsqueeze(2)  # (B, S, N, 3)
     dist_raw = torch.norm(diff, dim=-1, keepdim=True)  # (B, S, N, 1)
+    
     seed_S_exp = seed_S.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
     cand_S_exp = cand_S.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
+
+    # 1. Reshape 9D flat vectors back to 3x3 rotation matrices
+    R_seed = seed_rot.reshape(B, S, 3, 3)
+    R_cand = cand_rot.reshape(B, N, 3, 3)
+
+    # 2. Unsqueeze and transpose seed rotation for batched matrix multiplication [3, 4]
+    R_seed_T = R_seed.unsqueeze(2).transpose(-2, -1)  # (B, S, 1, 3, 3)
+    R_cand_exp = R_cand.unsqueeze(1)                  # (B, 1, N, 3, 3)
+
+    # 3. Compute relative rotation: [B, S, N, 3, 3]
+    R_rel = torch.matmul(R_seed_T, R_cand_exp)
+
+    # 4. Flatten the 3x3 relative rotation matrix back into a 9D vector
+    # This features is now 100% rotation-invariant!
+    rot_diff = R_rel.reshape(B, S, N, 9)
+
+    # 5. Optimized Cosine Similarity using the Trace [3]
+    # Trace(R_rel) = R_rel[0,0] + R_rel[1,1] + R_rel[2,2]
+    trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2] # (B, S, N)
+    rot_cosine = (trace / 3.0).unsqueeze(-1)                      # (B, S, N, 1)
 
     return torch.cat([
         torch.where(dist_raw > 1e-8, diff / dist_raw, torch.zeros_like(diff)),  # direction (3)
@@ -103,12 +140,12 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
         (torch.log10(torch.clamp((torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8)) / cand_S_exp, min=1e-8)) / 8),  # dist_bwn_normalized_c (1)
         (torch.log10(torch.clamp(dist_raw / seed_S_exp, min=1e-8)) / 8),          # dist_normalized_s (1)
         (torch.log10(torch.clamp(dist_raw / cand_S_exp, min=1e-8)) / 8),          # dist_normalized_c (1)
-        (torch.log10(seed_S_exp.expand(-1, -1, diff.size(2), -1)) / 6),           # seed_S_log (1)
-        (torch.log10(cand_S_exp.expand(-1, diff.size(1), -1, -1)) / 6),           # cand_S_log (1)
+        (torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 6),                      # seed_S_log (1)
+        (torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 6),                      # cand_S_log (1)
         (torch.log10(cand_S_exp / seed_S_exp) / 8),                                # rel_scale (1)
-        (seed_rot.unsqueeze(2) - cand_rot.unsqueeze(1)),                           # rot_diff (9)
-        ((seed_rot.unsqueeze(2) * cand_rot.unsqueeze(1)).sum(dim=-1, keepdim=True) / torch.clamp(torch.norm(seed_rot.unsqueeze(2), dim=-1, keepdim=True) * torch.norm(cand_rot.unsqueeze(1), dim=-1, keepdim=True), min=1e-8)),  # rot_cosine (1)
-    ], dim=-1)  # (B, S, N, 22)
+        rot_diff,                                                                  # rot_diff (9)
+        rot_cosine,                                                                # rot_cosine (1)
+    ], dim=-1)
 
 
 @MODELS.register_module()
@@ -327,6 +364,8 @@ class PurelyRelationalPeeler(nn.Module):
         for block in self.blocks:
             e = block(e, mask)
         affinity_logits = self.output_head(e).squeeze(-1)
+        mask = torch.where(mask < 0.0, torch.zeros_like(mask),
+                          torch.where(mask > 1.0, torch.ones_like(mask), mask))
         mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)
         affinity_logits_for_loss = affinity_logits + (1.0 - mask_2d) * -1e4
         return affinity_logits_for_loss

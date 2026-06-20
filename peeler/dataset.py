@@ -100,7 +100,7 @@ class PeelerDataset(Dataset):
         choices = np.arange(lower, upper + 1)
         
         # 2. Get the exponential decay probabilities specifically for this valid range [1]
-        probs = self.get_exponential_weights(lower, upper, 0.35)
+        probs = self.get_exponential_weights(lower, upper, 0.3)
         
         # 3. Sample a single integer K using the decay probabilities [1]
         # rng.choice will select exactly 1 integer according to your skewed weights
