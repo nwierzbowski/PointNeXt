@@ -5,8 +5,11 @@ dataset:
   asset_scale_std:
   - -1.0
   - 1.0
-  max_asset_fragments: 60
+  cluster_translation_scale:
+  - 1.6
+  - 0.7
   max_assets_per_soup: 12
+  max_fragments: 300
   min_assets_per_soup: 1
   scene_scale:
   - -3.0

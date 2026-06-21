@@ -37,40 +37,24 @@ class PeelerDataset(Dataset):
         all_transforms,
         max_assets_per_soup,
         min_assets_per_soup,
-        max_asset_fragments,
+        max_fragments,
         seed,
         translation_scale,
         asset_scale_std,
-        scene_scale
+        scene_scale,
+        cluster_translation_scale
     ):
         self.all_embeddings = all_embeddings  # list of (N_i, 256)
         self.all_transforms = all_transforms  # list of (N_i, 16)
         self.max_assets_per_soup = max_assets_per_soup
         self.min_assets_per_soup = min_assets_per_soup
-        self.max_asset_fragments = max_asset_fragments
+        self.max_fragments = max_fragments
         self.translation_scale = translation_scale
         self.asset_scale_std = asset_scale_std
         self.scene_scale = scene_scale
+        self.cluster_translation_scale = cluster_translation_scale
         self.seed = seed
         self._epoch = 0
-
-        # Subsample oversized assets to cap per-asset fragment count
-        if max_asset_fragments is not None:
-            rng = np.random.RandomState(seed)
-            subsampled_emb = []
-            subsampled_trans = []
-            for emb, trans in zip(all_embeddings, all_transforms):
-                n = len(emb)
-                if n > max_asset_fragments:
-                    indices = rng.choice(n, size=max_asset_fragments, replace=False)
-                    indices = np.sort(indices)
-                    subsampled_emb.append(emb[indices])
-                    subsampled_trans.append(trans[indices])
-                else:
-                    subsampled_emb.append(emb)
-                    subsampled_trans.append(trans)
-            self.all_embeddings = subsampled_emb
-            self.all_transforms = subsampled_trans
 
         self.n_assets = len(self.all_embeddings)
 
@@ -109,21 +93,42 @@ class PeelerDataset(Dataset):
         # Now k is a clean, single integer (e.g., 1, 2, or 3) weighted toward the low end!
         asset_indices = list(rng.choice(self.n_assets, size=k, replace=False))
 
-        # Combine all fragments from selected assets
+        # Combine fragments from selected assets, capped to max_fragments total
         soup_emb_list = []
         soup_trans_list = []
         asset_ids_list = []
         orig_indices_list = []
+        total_fragments = 0
+        asset_fragments = []
 
+        cap = self.max_fragments
         for aid, asset_gid in enumerate(asset_indices):
             emb = self.all_embeddings[asset_gid]
             trans = self.all_transforms[asset_gid]
+            n_fragments = len(emb)
+
+            # Check if adding this asset would exceed the cap
+            if total_fragments + n_fragments > cap:
+                n_fragments = cap - total_fragments
+                if n_fragments <= 0:
+                    break
+                indices = rng.choice(len(emb), size=n_fragments, replace=False)
+                indices = np.sort(indices)
+                emb = emb[indices]
+                trans = trans[indices]
+                n_fragments = len(emb)
+
             soup_emb_list.append(emb)
             soup_trans_list.append(trans)
-            asset_ids_list.append(np.full(len(emb), aid, dtype=np.int64))
-            # Encode (asset_gid, frag_idx) uniformly
-            for fi in range(len(emb)):
+            asset_ids_list.append(np.full(n_fragments, aid, dtype=np.int64))
+            for fi in range(n_fragments):
                 orig_indices_list.append(asset_gid * 100000 + fi)
+
+            total_fragments += n_fragments
+            asset_fragments.append(n_fragments)
+
+            if total_fragments >= cap:
+                break
 
         soup_emb = np.concatenate(soup_emb_list, axis=0)
         soup_trans = np.concatenate(soup_trans_list, axis=0)
@@ -134,8 +139,9 @@ class PeelerDataset(Dataset):
         asset_scale_range = getattr(self, 'asset_scale_std')
         if len(asset_scale_range) == 2:
             offset = 0
-            for asset_gid in asset_indices:
-                n_fragments = len(self.all_transforms[asset_gid])
+            for i in range(len(asset_fragments)):
+                asset_gid = asset_indices[i]
+                n_fragments = asset_fragments[i]
                 scale = rng.uniform(asset_scale_range[0], asset_scale_range[1])
                 scale = math.pow(10, scale)
 
@@ -149,10 +155,21 @@ class PeelerDataset(Dataset):
         translation_scale_range = getattr(self, 'translation_scale')
         offset = 0
         sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
-        for asset_gid in asset_indices:
-            n_fragments = len(self.all_transforms[asset_gid])
-            
-            t = rng.randn(3).astype(np.float32) * sigma
+
+        cluster_scale_range = getattr(self, 'cluster_translation_scale')
+        sigma2 = rng.lognormal(cluster_scale_range[0], cluster_scale_range[1])
+
+        # Choose 1 or 2 base positions for clustering (50/50)
+        num_base = int(rng.choice([1, 2]))
+        base_positions = [rng.randn(3).astype(np.float32) * sigma2 for _ in range(num_base)]
+
+        for i in range(len(asset_fragments)):
+            asset_gid = asset_indices[i]
+            n_fragments = asset_fragments[i]
+
+            # Pick a base position (50/50) and add per-asset random offset
+            chosen = int(rng.choice(num_base))
+            t = base_positions[chosen] + rng.randn(3).astype(np.float32) * sigma
             # Translation is at indices 3, 7, 11 of each row (4th column of row-major 4x4)
             soup_trans[offset:offset + n_fragments, 3] += t[0]
             soup_trans[offset:offset + n_fragments, 7] += t[1]
