@@ -18,7 +18,7 @@ def get_device(device):
     return torch.device(device)
 
 
-def _build_peeler_dataset(cfg, all_embeddings, all_transforms):
+def build_peeler_dataset(cfg, all_embeddings, all_transforms):
     """Build PeelerDataset from TBO data.
 
     Args:
@@ -116,7 +116,7 @@ def setup(
     batch_size = cfg.batch_size
 
     # Build train dataset
-    train_dataset = _build_peeler_dataset(cfg, all_embeddings, all_transforms)
+    train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -133,7 +133,7 @@ def setup(
     # Build validation dataset (optional)
     val_loader = None
     if test_embeddings is not None and test_transforms is not None:
-        val_dataset = _build_peeler_dataset(cfg, test_embeddings, test_transforms)
+        val_dataset = build_peeler_dataset(cfg, test_embeddings, test_transforms)
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,

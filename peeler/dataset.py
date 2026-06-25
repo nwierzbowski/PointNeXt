@@ -236,8 +236,31 @@ class PeelerDataset(Dataset):
                 'num_assets': len(asset_fragments),
                 'avg_fragments': sum(asset_fragments) / len(asset_fragments) if asset_fragments else 0,
                 'asset_fragments': list(asset_fragments),
+                'max_total_fragments': MAX_TOTAL_FRAGMENTS,
             },
         }
+
+    def compute_stats(self, num_samples=None):
+        """Compute dataset statistics by iterating samples once.
+
+        Args:
+            num_samples: Number of samples to process. None = entire dataset.
+
+        Returns:
+            (asset_counts, asset_fragments, budgets) tuples for histogram widget
+        """
+        asset_counts = []
+        asset_fragments = []
+        budgets = []
+        n = num_samples or len(self)
+        for i in range(n):
+            sample = self[i]
+            stats = sample.get('soup_stats', {})
+            if stats:
+                asset_counts.append(stats['num_assets'])
+                asset_fragments.append(tuple(stats['asset_fragments']))
+                budgets.append(stats['max_total_fragments'])
+        return asset_counts, asset_fragments, budgets
 
     @staticmethod
     def collate_fn(datas):
