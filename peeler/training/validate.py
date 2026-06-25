@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.cluster import DBSCAN
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+from sklearn.metrics import adjusted_rand_score
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
@@ -196,12 +196,11 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs, th
     """Run validation loop with Average-Linkage clustering.
 
     Returns:
-        (loss, ari, nmi, f1)
+        (loss, ari, f1)
     """
     model.eval()
     total_loss = 0.0
     ari_sum = 0.0
-    nmi_sum = 0.0
     batch_count = 0
     tp_sum = 0.0
     fp_sum = 0.0
@@ -252,7 +251,6 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs, th
                     pred_labels = _cluster_with_average_linkage(b_affinities, threshold=threshold)
 
                     ari_sum += adjusted_rand_score(gt_labels, pred_labels)
-                    nmi_sum += normalized_mutual_info_score(gt_labels, pred_labels)
                     batch_count += 1
             else:
                 refined_emb = model(embeddings, transforms, mask)
@@ -270,10 +268,9 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs, th
     num_batches = max(len(val_loader), 1)
     avg_loss = total_loss / num_batches
     avg_ari = ari_sum / batch_count if batch_count > 0 else 0.0
-    avg_nmi = nmi_sum / batch_count if batch_count > 0 else 0.0
 
     precision = tp_sum / (tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else 0.0
     recall = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    return avg_loss, avg_ari, avg_nmi, f1
+    return avg_loss, avg_ari, f1

@@ -247,7 +247,6 @@ class PurelyRelationalBlock(nn.Module):
 
     def forward(self, e, mask):
         B, N, _, D = e.shape
-        highway = e
         left = self.left_proj(e)
         right = self.right_proj(e)
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
@@ -259,7 +258,7 @@ class PurelyRelationalBlock(nn.Module):
         triangular_out = triangular_sum.permute(0, 2, 3, 1)
         result = self.proj_up(triangular_out)
         result = result * mask_2d
-        return highway + result
+        return e + result
 
 
 class MLPBlock(nn.Module):

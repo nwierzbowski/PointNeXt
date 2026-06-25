@@ -3,7 +3,7 @@ dataset:
   NAME: TBODataset
   num_points: 1024
 epochs: 151
-lr: 0.0005
+lr: 0.002
 min_lr: 5.0e-05
 model:
   NAME: PointNextMAE
@@ -16,7 +16,7 @@ model:
   - xyz_x
   - xyz_y
   - xyz_z
-  decoder_hidden_dim: 1024
+  decoder_hidden_dim: 512
   decoder_points: 1024
   encoder_args:
     NAME: PointNextEncoder
@@ -48,7 +48,7 @@ model:
     - 4
     - 4
     - 4
-    - 1
+    - 2
     width: 64
   encoder_channels:
   - xyz_x
@@ -63,5 +63,5 @@ optimizer:
 sched: warmup_cosine
 training:
   device: cuda
-  report_interval: 10
-warmup_t: 1000
+  report_interval: 20
+warmup_t: 200

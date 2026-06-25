@@ -27,6 +27,7 @@ def peeler_train(
     log_callback=None,
     epoch_callback=None,
     step_callback=None,
+    histogram_callback=None,
     stop_callback=None,
 ):
     """Full peeler training pipeline.
@@ -45,8 +46,9 @@ def peeler_train(
         checkpoint_dir: Directory for checkpoint files
         start_epoch: Epoch to resume from (0 = fresh start)
         log_callback: Called with (message: str)
-        epoch_callback: Called with (epoch, total, loss, val_loss, val_ari, val_nmi, lr)
+        epoch_callback: Called with (epoch, total, loss, val_loss, val_ari, lr, val_f1)
         step_callback: Called with (step, epoch, loss)
+        histogram_callback: Called with ((asset_counts: list[int], avg_frags: list[float])) after each epoch
         stop_callback: Called with no args, returns True to stop training
 
     Returns:
@@ -94,6 +96,7 @@ def peeler_train(
         log_callback=log_callback,
         epoch_callback=epoch_callback,
         step_callback=step_callback,
+        histogram_callback=histogram_callback,
         stop_callback=stop_callback,
     )
 
@@ -126,6 +129,7 @@ def _train(
     epoch_callback=None,
     scaler=None,
     step_callback=None,
+    histogram_callback=None,
     report_interval=10,
     ema_alpha=0.1,
     best_metric='ari',
@@ -147,6 +151,8 @@ def _train(
         num_batches = 0
         stopped = False
         use_amp = scaler is not None
+        soup_asset_counts = []
+        soup_asset_fragments = []
 
         for batch_idx, batch in enumerate(train_loader):
             dtype = torch.bfloat16 if use_amp else torch.float32
@@ -190,6 +196,12 @@ def _train(
             num_batches += 1
             global_step += 1
 
+            # Collect soup stats for histogram
+            if 'soup_stats' in batch:
+                for stats in batch['soup_stats']:
+                    soup_asset_counts.append(stats['num_assets'])
+                    soup_asset_fragments.append(stats['asset_fragments'])
+
             if stop_callback and stop_callback():
                 if log_callback:
                     log_callback('Training stopped by user')
@@ -221,16 +233,19 @@ def _train(
         # Validation every epoch
         val_loss = avg_loss
         val_ari = 0.0
-        val_nmi = 0.0
         val_f1 = 0.0
         if val_loader is not None:
-            val_loss, val_ari, val_nmi, val_f1 = validate(
+            val_loss, val_ari, val_f1 = validate(
                 model, val_loader, criterion, device, scaler, epoch, num_epochs, threshold=validation_threshold
             )
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
-            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_ari, val_nmi, lr, val_f1)
+            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_ari, lr, val_f1)
+
+        # Report asset count histogram
+        if soup_asset_counts and histogram_callback:
+            histogram_callback((tuple(soup_asset_counts), tuple(tuple(f) for f in soup_asset_fragments)))
 
         # Best model by selected metric
         metric_values = {
