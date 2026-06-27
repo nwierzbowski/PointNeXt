@@ -18,7 +18,8 @@ dataset:
   - 1.1
 embedding_noise_sigma: 0.004
 epochs: 60
-lr: 0.0015
+grad_accum_steps: 8
+lr: 0.002
 lr_pct_start: 0.1
 model:
   NAME: PurelyRelationalPeeler

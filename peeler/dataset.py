@@ -39,7 +39,7 @@ class PeelerDataset(Dataset):
         translation_scale,
         asset_scale_std,
         scene_scale,
-        cluster_translation_scale
+        cluster_translation_scale,
     ):
         self.all_embeddings = all_embeddings  # list of (N_i, 256)
         self.all_transforms = all_transforms  # list of (N_i, 16)
@@ -66,29 +66,101 @@ class PeelerDataset(Dataset):
         """Set the epoch for randomization."""
         self._epoch = epoch
 
+    @staticmethod
+    def _sample_soup_partition(rng, N, mu=None, u=None):
+        """Capped GMS sampler for perfect pairwise matrix uniformity.
+
+        Caps the maximum asset count to preserve physical asset sizes (no singletons),
+        while using GMS to guarantee that the actual connection density (mu)
+        and relational entropy (u) are perfectly uniform with zero rounding collapse.
+        """
+        # Set the maximum number of assets allowed in a soup
+        # (With N=150, capping at 30 guarantees average asset size >= 5 fragments)
+        if mu is None and u is None:
+            if rng.uniform(0.0, 1.0) < 0.02:
+                return [N], 1, float('inf'), 1.0, 0.0
+
+        K_cap = N // 6
+
+        # Sample target density mu uniformly above the K_cap limit
+        if mu is None:
+            r = rng.uniform(0.0, 1.0)
+            mu = 1.0 / K_cap + r * (1.0 - 1.0 / K_cap)
+        mu = np.clip(mu, 1.0 / K_cap, 1.0)
+
+        if np.isclose(mu, 1.0):
+            return [N], 1, float('inf'), mu, 0.0
+
+        if u is None:
+            u = rng.uniform(0.0, 1.0)
+        u = np.clip(u, 0.0, 1.0)
+
+        # Interpolate k between k_min and K_cap
+        k_min = int(np.ceil(1.0 / mu))
+        k_max = K_cap
+        k = int(np.round(k_min + u * (k_max - k_min)))
+        k = max(2, min(k, K_cap))
+
+        # 2. CALIBRATION: Invert the GMS scaling offset
+        # This solves for the exact weight density needed to yield a final mu
+        # after the +1 upfront allocation is added back.
+        free_budget = N - k
+        if free_budget > 0:
+            mu_weights = (mu * N * N - 2 * N + k) / (free_budget * free_budget)
+            mu_weights = np.clip(mu_weights, 1.0 / k, 1.0)
+        else:
+            mu_weights = 1.0 / k
+
+        denominator = (mu_weights * k) - 1.0
+        if np.isclose(denominator, 0.0) or denominator < 0:
+            alpha = 10000.0
+        else:
+            alpha = (1.0 - mu_weights) / denominator
+            alpha = max(alpha, 0.01)
+
+        weights = rng.dirichlet(np.ones(k) * alpha)
+
+        # --- GUARANTEED MINIMUM SIZE (GMS) ALLOCATION ---
+        # Distribute N fragments among k assets, guaranteeing size >= 1
+        free_budget = N - k
+        
+        if free_budget > 0:
+            scaled = weights * free_budget
+            sizes = np.floor(scaled).astype(int)
+
+            remainder = free_budget - np.sum(sizes)
+            if remainder > 0:
+                fractional_parts = scaled - sizes
+                largest_indices = np.argsort(fractional_parts)[::-1][:remainder]
+                sizes[largest_indices] += 1
+            
+            final_sizes = sizes + 1
+        else:
+            final_sizes = np.ones(k, dtype=np.int32)
+
+        if len(final_sizes) == 0:
+            final_sizes = [N]
+            k = 1
+            alpha = float('inf')
+
+        return sorted(list(final_sizes), reverse=True), k, alpha, mu, u
+
     def __len__(self):
         return self.n_assets
+
+    def _find_bucket_at_or_below(self, target_size):
+        """Find the bucket size at or below target_size. Falls back to smallest bucket."""
+        idx = np.searchsorted(self._bucket_sizes, target_size, side='right') - 1
+        if idx < 0:
+            idx = 0
+        return int(self._bucket_sizes[idx])
 
     def __getitem__(self, idx):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
 
-        # Dynamic Budget Allocation Loop
-        MAX_TOTAL_FRAGMENTS = int(rng.randint(1, self.max_fragments + 1))
-
-        # Dynamic K distribution based on actual budget
-        max_k_half = max(1, MAX_TOTAL_FRAGMENTS // 2)
-        k_values = list(range(1, max_k_half + 1))
-        fixed_weights = [0.1, 0.05, 0.04, 0.03, 0.015]
-        
-        if max_k_half <= 5:
-            k_weights = np.array(fixed_weights[:max_k_half], dtype=np.float32)
-        else:
-            uniform_weight = 0.765 / (max_k_half - 5)
-            k_weights = np.array(fixed_weights + [uniform_weight] * (max_k_half - 5), dtype=np.float32)
-        
-        k_weights /= k_weights.sum()
-        k = int(rng.choice(k_values, p=k_weights))
+        N = self.max_fragments
+        sizes, k, alpha, mu, u = self._sample_soup_partition(rng, N)
 
         soup_emb_list = []
         soup_trans_list = []
@@ -97,62 +169,32 @@ class PeelerDataset(Dataset):
         total_fragments = 0
         asset_fragments = []
         soup_asset_gids = []
-        first_asset_fragments = None
 
-        for step in range(k):
-            if total_fragments >= MAX_TOTAL_FRAGMENTS:
-                break
-                
-            remaining_slots = k - len(asset_ids_list) - 1  # slots AFTER this one
-            remaining_budget = MAX_TOTAL_FRAGMENTS - total_fragments
-            max_asset_size = remaining_budget - remaining_slots  # leave at least 1 per remaining slot
-
-            # Log-weighted selection: each doubling range gets equal probability
-            max_eligible = max_asset_size
-            if first_asset_fragments is not None:
-                max_eligible = min(max_eligible, first_asset_fragments)
-
-            idx_limit = np.searchsorted(self._bucket_sizes, max_eligible, side='right')
-            if idx_limit == 0:
-                break  # no eligible assets, stop early
-            
-            eligible_sizes = self._bucket_sizes[:idx_limit]
-            if first_asset_fragments is None:
-                # First asset: uniform per bucket
-                weights = np.ones(len(eligible_sizes), dtype=np.float32)
-            else:
-                # Subsequent assets: log1p(size) directly → favors larger sizes
-                weights = np.log1p(eligible_sizes).astype(np.float32)
-            weights /= weights.sum()
-            
-            chosen_idx = rng.choice(len(eligible_sizes), p=weights)
-            chosen_bucket_size = int(eligible_sizes[chosen_idx])
-            bucket_pool = self._fragments_by_count[chosen_bucket_size]
+        for s in sizes:
+            bucket_size = self._find_bucket_at_or_below(s)
+            bucket_pool = self._fragments_by_count[bucket_size]
             asset_gid = int(rng.choice(bucket_pool))
-            
+
             emb = self.all_embeddings[asset_gid]
             trans = self.all_transforms[asset_gid]
+            n_available = len(emb)
+
+            # Sample bucket_size fragments from the asset (handles oversized assets)
+            if n_available > bucket_size:
+                chosen_idx = rng.choice(n_available, bucket_size, replace=False)
+                chosen_idx.sort()
+                emb = emb[chosen_idx]
+                trans = trans[chosen_idx]
+                local_indices = chosen_idx
+            else:
+                local_indices = np.arange(n_available)
+
             n_fragments = len(emb)
-
-            if first_asset_fragments is None:
-                first_asset_fragments = n_fragments
-
-            # Cap the final asset if we overflow the budget
-            if total_fragments + n_fragments > MAX_TOTAL_FRAGMENTS:
-                n_fragments = MAX_TOTAL_FRAGMENTS - total_fragments
-                if n_fragments <= 0:
-                    break
-                indices = rng.choice(len(emb), size=n_fragments, replace=False)
-                indices = np.sort(indices)
-                emb = emb[indices]
-                trans = trans[indices]
-                n_fragments = len(emb)
 
             soup_emb_list.append(emb)
             soup_trans_list.append(trans)
             asset_ids_list.append(np.full(n_fragments, len(asset_ids_list), dtype=np.int64))
-            for fi in range(n_fragments):
-                orig_indices_list.append(asset_gid * 100000 + fi)
+            orig_indices_list.extend(local_indices + asset_gid * 1_000_000_000)
 
             total_fragments += n_fragments
             asset_fragments.append(n_fragments)
@@ -164,7 +206,7 @@ class PeelerDataset(Dataset):
         orig_indices = np.array(orig_indices_list, dtype=np.int64)
 
         # Scale normalized asset offsets by random factor (uniform range per asset)
-        asset_scale_range = getattr(self, 'asset_scale_std')
+        asset_scale_range = self.asset_scale_std
         if len(asset_scale_range) == 2:
             offset = 0
             for i in range(len(asset_fragments)):
@@ -180,15 +222,15 @@ class PeelerDataset(Dataset):
                 offset += n_fragments
 
         # Random translation augmentation: per-asset translation in world space
-        translation_scale_range = getattr(self, 'translation_scale')
+        translation_scale_range = self.translation_scale
         offset = 0
         sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
 
-        cluster_scale_range = getattr(self, 'cluster_translation_scale')
+        cluster_scale_range = self.cluster_translation_scale
         sigma2 = rng.lognormal(cluster_scale_range[0], cluster_scale_range[1])
 
         max_base = 3 + len(asset_fragments) // 10
-        cluster_weights = np.array([0.1 + 1 / (2 ** x) for x in range(max_base)], dtype=np.float32)
+        cluster_weights = np.array([0.05 + 2 ** -x for x in range(max_base)], dtype=np.float32)
         cluster_weights /= cluster_weights.sum()
         num_base = int(rng.choice(max_base, p=cluster_weights)) + 1
         base_positions = [rng.randn(3).astype(np.float32) * sigma2 for _ in range(num_base)]
@@ -207,7 +249,7 @@ class PeelerDataset(Dataset):
             offset += n_fragments
 
         # Random scene scaling (uniform factor for entire soup)
-        scene_scale_range = getattr(self, 'scene_scale')
+        scene_scale_range = self.scene_scale
         scene_factor = rng.uniform(scene_scale_range[0], scene_scale_range[1])
         scene_factor = math.pow(10, scene_factor)
         
@@ -225,18 +267,34 @@ class PeelerDataset(Dataset):
         # Build N x N ground truth: Y_ij = 1 if same asset (bool, 1/4 memory of float32)
         Y = (asset_ids[:, None] == asset_ids[None, :])
 
+        actual_n = len(soup_emb)
+        actual_mu = sum(s * s for s in asset_fragments) / (actual_n * actual_n) if actual_n > 0 else 0.0
+
+        actual_k = len(asset_fragments)
+        k_min = int(np.ceil(1.0 / actual_mu))
+        k_max = N // 6
+        actual_u = (actual_k - k_min) / (k_max - k_min) if (k_max - k_min) > 0 else 0.0
+        actual_u = float(np.clip(actual_u, 0.0, 1.0))
+
         return {
             'embeddings': torch.from_numpy(soup_emb),
             'transforms': torch.from_numpy(soup_trans),
             'Y': torch.from_numpy(Y),
             'orig_indices': torch.from_numpy(orig_indices),
             'asset_ids': torch.from_numpy(asset_ids),
-            'soup_count': k,
+            'soup_count': len(asset_fragments),
             'soup_stats': {
                 'num_assets': len(asset_fragments),
                 'avg_fragments': sum(asset_fragments) / len(asset_fragments) if asset_fragments else 0,
                 'asset_fragments': list(asset_fragments),
-                'max_total_fragments': MAX_TOTAL_FRAGMENTS,
+                'target_mu': mu,
+                'target_u': u,
+                'actual_mu': actual_mu,
+                'actual_u': actual_u,
+                'k': k,
+                'alpha': alpha,
+                'target_n': N,
+                'actual_n': actual_n,
             },
         }
 
@@ -247,11 +305,13 @@ class PeelerDataset(Dataset):
             num_samples: Number of samples to process. None = entire dataset.
 
         Returns:
-            (asset_counts, asset_fragments, budgets) tuples for histogram widget
+            (asset_counts, asset_fragments, actual_ns, actual_mus, actual_us) tuples for histogram widget
         """
         asset_counts = []
         asset_fragments = []
-        budgets = []
+        actual_ns = []
+        actual_mus = []
+        actual_us = []
         n = num_samples or len(self)
         for i in range(n):
             sample = self[i]
@@ -259,8 +319,10 @@ class PeelerDataset(Dataset):
             if stats:
                 asset_counts.append(stats['num_assets'])
                 asset_fragments.append(tuple(stats['asset_fragments']))
-                budgets.append(stats['max_total_fragments'])
-        return asset_counts, asset_fragments, budgets
+                actual_ns.append(stats['actual_n'])
+                actual_mus.append(stats['actual_mu'])
+                actual_us.append(stats['actual_u'])
+        return asset_counts, asset_fragments, actual_ns, actual_mus, actual_us
 
     @staticmethod
     def collate_fn(datas):

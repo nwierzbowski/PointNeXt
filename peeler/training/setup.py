@@ -114,6 +114,7 @@ def setup(
     num_epochs = cfg.epochs
 
     batch_size = cfg.batch_size
+    grad_accum_steps = cfg.get('grad_accum_steps', 1)
 
     # Build train dataset
     train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms)
@@ -190,11 +191,12 @@ def setup(
 
     # Build scheduler (OneCycleLR with warmup + cosine decay)
     scheduler_cfg = cfg.get('scheduler', {})
+    effective_steps_per_epoch = (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=cfg.lr,
         epochs=num_epochs,
-        steps_per_epoch=len(train_loader),
+        steps_per_epoch=effective_steps_per_epoch,
         pct_start=cfg.lr_pct_start,
         anneal_strategy='cos',
         cycle_momentum=False,

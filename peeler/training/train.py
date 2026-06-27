@@ -78,6 +78,8 @@ def peeler_train(
     validation_threshold = cfg.get('validation', {}).get('threshold', 0.5)
 
     # 4. Internal train() — called with all config loaded
+    grad_accum_steps = cfg.get('grad_accum_steps', 1)
+
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
         num_epochs=num_epochs,
@@ -90,6 +92,7 @@ def peeler_train(
         best_metric=best_metric,
         embedding_noise_sigma=embedding_noise_sigma,
         validation_threshold=validation_threshold,
+        grad_accum_steps=grad_accum_steps,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -131,6 +134,7 @@ def _train(
     best_metric='ari',
     embedding_noise_sigma=0.0,
     validation_threshold=0.5,
+    grad_accum_steps=1,
 ):
     """Run the training epoch loop."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
@@ -148,6 +152,7 @@ def _train(
         stopped = False
         use_amp = scaler is not None
 
+        step_loss_accum = 0.0
         for batch_idx, batch in enumerate(train_loader):
             dtype = torch.bfloat16 if use_amp else torch.float32
             embeddings = batch['embeddings'].to(device, dtype=dtype, non_blocking=True)
@@ -157,7 +162,10 @@ def _train(
             mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
             asset_ids = batch['asset_ids'].to(device, dtype=torch.long, non_blocking=True)
 
-            optimizer.zero_grad()
+            is_accum_start = batch_idx % grad_accum_steps == 0
+            if is_accum_start:
+                optimizer.zero_grad()
+                step_loss_accum = 0.0
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
                 model_name = type(model).__name__
@@ -169,49 +177,60 @@ def _train(
                     refined_emb = model(embeddings, transforms, mask)
                     loss, loss_dict = criterion(refined_emb, asset_ids, mask, epoch, num_epochs)
 
+            step_loss_accum += loss.item()
+
+            loss = loss / grad_accum_steps
+
             if use_amp:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
             else:
                 loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            is_accum_end = (batch_idx + 1) % grad_accum_steps == 0 or batch_idx == len(train_loader) - 1
+            if is_accum_end:
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
 
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
 
-            batch_loss = loss.item()
+                scheduler.step_update(global_step) if hasattr(scheduler, 'step_update') else scheduler.step()
+                global_step += 1
 
-            scheduler.step_update(global_step) if hasattr(scheduler, 'step_update') else scheduler.step()
-            total_loss += batch_loss
-            num_batches += 1
-            global_step += 1
+                actual_accum = (batch_idx + 1) % grad_accum_steps
+                if actual_accum == 0:
+                    actual_accum = grad_accum_steps
+                batch_loss = step_loss_accum / actual_accum
+
+                total_loss += batch_loss
+                num_batches += 1
+
+                if step_callback and global_step % report_interval == 0:
+                    if ema_loss is None:
+                        ema_loss = batch_loss
+                    else:
+                        ema_loss = ema_alpha * batch_loss + (1 - ema_alpha) * ema_loss
+                    step_callback(global_step, epoch, ema_loss)
+
+                    if log_callback:
+                        elapsed = time.time() - epoch_start_time
+                        iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
+                        lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
+                        log_callback(
+                            f'Step {global_step} (epoch {epoch}) - '
+                            f'Loss: {ema_loss:.4f} | LR: {lr:.6f} | '
+                            f'{iters_per_sec:.1f} it/s'
+                        )
 
             if stop_callback and stop_callback():
                 if log_callback:
                     log_callback('Training stopped by user')
                 stopped = True
                 break
-
-            if step_callback and global_step % report_interval == 0:
-                if ema_loss is None:
-                    ema_loss = batch_loss
-                else:
-                    ema_loss = ema_alpha * batch_loss + (1 - ema_alpha) * ema_loss
-                step_callback(global_step, epoch, ema_loss)
-
-                if log_callback:
-                    elapsed = time.time() - epoch_start_time
-                    iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
-                    lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
-                    log_callback(
-                        f'Step {global_step} (epoch {epoch}) - '
-                        f'Loss: {ema_loss:.4f} | LR: {lr:.6f} | '
-                        f'{iters_per_sec:.1f} it/s'
-                    )
 
         if stopped:
             break
