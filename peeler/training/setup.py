@@ -40,6 +40,35 @@ def build_peeler_dataset(cfg, all_embeddings, all_transforms):
         cluster_translation_scale=dataset_cfg.get('cluster_translation_scale', [1.6, 0.7]),
         asset_scale_std=dataset_cfg.get('asset_scale_std', 1.0),
         scene_scale=dataset_cfg.get('scene_scale', [0.8, 1.2]),
+        embedding_noise_sigma=cfg.get('embedding_noise_sigma', 0.0),
+        translation_noise_sigma=dataset_cfg.get('translation_noise_sigma', 0.0),
+        scaling_noise_sigma=dataset_cfg.get('scaling_noise_sigma', 0.0),
+        per_asset_rotation=dataset_cfg.get('per_asset_rotation', True),
+    )
+
+
+def build_peeler_val_dataset(cfg, all_embeddings, all_transforms, asset_to_file):
+    """Build PeelerValidationDataset from TBO data.
+
+    Each TBO file = one soup. No random mixing, no augmentation.
+
+    Args:
+        cfg: EasyConfig with dataset settings
+        all_embeddings: list of numpy arrays (N_i, 256), one per asset
+        all_transforms: list of numpy arrays (N_i, 16), one per asset
+        asset_to_file: list mapping asset_idx -> file_idx
+
+    Returns:
+        PeelerValidationDataset instance
+    """
+    from peeler.val_dataset import PeelerValidationDataset
+    dataset_cfg = cfg.dataset
+    return PeelerValidationDataset(
+        all_embeddings=all_embeddings,
+        all_transforms=all_transforms,
+        asset_to_file=asset_to_file,
+        max_fragments=dataset_cfg.get('max_fragments', 700),
+        seed=dataset_cfg.get('seed', 42),
     )
 
 
@@ -81,6 +110,7 @@ def setup(
     log_callback=None,
     test_embeddings=None,
     test_transforms=None,
+    test_asset_to_file=None,
 ):
     """Unified setup for peeler training.
 
@@ -94,6 +124,7 @@ def setup(
         log_callback: callable(str) for progress logging
         test_embeddings: list of numpy arrays (N_i, 256), one per test asset
         test_transforms: list of numpy arrays (N_i, 16), one per test asset
+        test_asset_to_file: list mapping test asset_idx -> file_idx for validation soups
 
     Returns:
         (model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device, num_epochs)
@@ -134,10 +165,10 @@ def setup(
     # Build validation dataset (optional)
     val_loader = None
     if test_embeddings is not None and test_transforms is not None:
-        val_dataset = build_peeler_dataset(cfg, test_embeddings, test_transforms)
+        val_dataset = build_peeler_val_dataset(cfg, test_embeddings, test_transforms, test_asset_to_file)
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=cfg.validation.get('batch_size', 1),
             shuffle=False,
             num_workers=2,
             pin_memory=True,

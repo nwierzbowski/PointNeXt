@@ -19,7 +19,7 @@ from openpoints.models.build import MODELS
 
 
 TRANSFORM_DIM = 6
-_REL_FEATURE_DIM = 22
+
 
 
 def transforms_to_pose(transforms, mask):
@@ -42,32 +42,27 @@ def transforms_to_pose(transforms, mask):
     rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
 
     mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
-    num_active = mask_expanded.sum(dim=1, keepdim=True)  # (B, 1, 1)
+    # num_active = mask_expanded.sum(dim=1, keepdim=True)  # (B, 1, 1)
 
     active_translation = translation * mask_expanded
-    center = active_translation.sum(dim=1, keepdim=True) / (num_active + 1e-8)
+    # center = active_translation.sum(dim=1, keepdim=True) / (num_active + 1e-8)
 
-    relative_translation = (translation - center) * mask_expanded
+    # relative_translation = (translation - center) * mask_expanded
 
     # Normalize by average distance per batch
-    active_scales_sum = (scale * mask_expanded).sum(dim=1, keepdim=True)  # (B, 1, 1)
-    avg_distance = active_scales_sum / (num_active + 1e-8)  # (B, 1, 1)
-
-    # active_distance_sum = torch.sum(torch.norm(relative_translation, dim=-1), dim=-1)
-    # avg_distance = active_distance_sum / (num_active.squeeze() + 1e-8)  # (B,) / (B,) = (B,)
-    # avg_distance = torch.clamp(avg_distance, min=1e-8)
-    # avg_distance = avg_distance.view(B, 1, 1)  # (B, 1, 1)
+    # active_scales_sum = (scale * mask_expanded).sum(dim=1, keepdim=True)  # (B, 1, 1)
+    # avg_distance = active_scales_sum / (num_active + 1e-8)  # (B, 1, 1)
 
     # Break degeneracy: when all positions are identical, add small deterministic
     # per-fragment perturbation based on fragment index. ONNX-compatible (no randomness).
-    indices = torch.arange(N, device=transforms.device, dtype=torch.float32)
-    perturbation = torch.sin(indices.unsqueeze(-1) * 0.1) * 1e-4  # (N, 3)
-    relative_translation = relative_translation + perturbation.unsqueeze(0)  # broadcast to (B, N, 3)
+    # indices = torch.arange(N, device=transforms.device, dtype=torch.float32)
+    # perturbation = torch.sin(indices.unsqueeze(-1) * 0.1) * 1e-4  # (N, 3)
+    # relative_translation = relative_translation + perturbation.unsqueeze(0)  # broadcast to (B, N, 3)
     
-    relative_translation = relative_translation / avg_distance
-    scale = scale / avg_distance
+    # relative_translation = relative_translation / avg_distance
+    # scale = scale / avg_distance
 
-    return relative_translation, scale, rot
+    return active_translation, scale, rot
 
 
 def compute_transform_features(translation, scale):
@@ -104,7 +99,6 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     """
     B, S, _ = seed_T.shape
     _, N, _ = cand_T.shape
-    device = seed_T.device
 
     diff = cand_T.unsqueeze(1) - seed_T.unsqueeze(2)  # (B, S, N, 3)
     dist_raw = torch.norm(diff, dim=-1, keepdim=True)  # (B, S, N, 1)
@@ -132,6 +126,9 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2] # (B, S, N)
     rot_cosine = (trace / 3.0).unsqueeze(-1)                      # (B, S, N, 1)
 
+    # print("max: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
+    # print("min: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
+
     return torch.cat([
         torch.where(dist_raw > 1e-8, diff / dist_raw, torch.zeros_like(diff)),  # direction (3)
         (torch.log10(torch.clamp(dist_raw, min=1e-8)) / 8) + 1,                  # dist (1)
@@ -147,6 +144,7 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
         rot_cosine,                                                                # rot_cosine (1)
     ], dim=-1)
 
+_REL_FEATURE_DIM = 22
 
 @MODELS.register_module()
 class Peeler(nn.Module):
@@ -316,8 +314,8 @@ class PurelyRelationalPeeler(nn.Module):
             nn.Linear(128, _PAIRWISE_DIM),
         )
         self.input_proj = nn.Sequential(
-            nn.LayerNorm(_REL_FEATURE_DIM + _PAIRWISE_DIM),
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 512),
+            nn.LayerNorm(_REL_FEATURE_DIM),
+            nn.Linear(_REL_FEATURE_DIM, 512),
             GeGLU(),
             nn.Linear(256, highway_dim)
         )
@@ -359,7 +357,7 @@ class PurelyRelationalPeeler(nn.Module):
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
         # Concat relative features + pairwise features
         combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
-        e = self.input_proj(combined)
+        e = self.input_proj(rel_feats)
         for block in self.blocks:
             e = block(e, mask)
         affinity_logits = self.output_head(e).squeeze(-1)

@@ -74,7 +74,6 @@ def peeler_train(
     report_interval = cfg['training']['report_interval']
     ema_alpha = cfg['training']['ema_alpha']
     best_metric = 'ari'
-    embedding_noise_sigma = cfg['embedding_noise_sigma']
     validation_threshold = cfg.get('validation', {}).get('threshold', 0.5)
 
     # 4. Internal train() — called with all config loaded
@@ -90,7 +89,6 @@ def peeler_train(
         report_interval=report_interval,
         ema_alpha=ema_alpha,
         best_metric=best_metric,
-        embedding_noise_sigma=embedding_noise_sigma,
         validation_threshold=validation_threshold,
         grad_accum_steps=grad_accum_steps,
         save_checkpoint_callback=_make_checkpoint_callback(),
@@ -132,7 +130,6 @@ def _train(
     report_interval=10,
     ema_alpha=0.1,
     best_metric='ari',
-    embedding_noise_sigma=0.0,
     validation_threshold=0.5,
     grad_accum_steps=1,
 ):
@@ -156,8 +153,6 @@ def _train(
         for batch_idx, batch in enumerate(train_loader):
             dtype = torch.bfloat16 if use_amp else torch.float32
             embeddings = batch['embeddings'].to(device, dtype=dtype, non_blocking=True)
-            if embedding_noise_sigma > 0:
-                embeddings = embeddings + torch.randn_like(embeddings) * embedding_noise_sigma
             transforms = batch['transforms'].to(device, dtype=dtype, non_blocking=True)
             mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
             asset_ids = batch['asset_ids'].to(device, dtype=torch.long, non_blocking=True)
