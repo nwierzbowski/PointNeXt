@@ -228,12 +228,12 @@ class PurelyRelationalBlock(nn.Module):
         
         self.left_proj = nn.Sequential(
             nn.Linear(highway_dim, target_dim * 2),
-            nn.LayerNorm(target_dim * 2),
+            # nn.LayerNorm(target_dim * 2),
             GeGLU(),
         )
         self.right_proj = nn.Sequential(
             nn.Linear(highway_dim, target_dim * 2),
-            nn.LayerNorm(target_dim * 2),
+            # nn.LayerNorm(target_dim * 2),
             GeGLU(),
         )
         self.proj_up = nn.Sequential(
@@ -312,10 +312,10 @@ class PurelyRelationalPeeler(nn.Module):
             GeGLU(),
             nn.Dropout(pairwise_dropout),
             nn.Linear(128, _PAIRWISE_DIM),
+            nn.LayerNorm(_PAIRWISE_DIM)
         )
         self.input_proj = nn.Sequential(
-            nn.LayerNorm(_REL_FEATURE_DIM),
-            nn.Linear(_REL_FEATURE_DIM, 512),
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 512),
             GeGLU(),
             nn.Linear(256, highway_dim)
         )
@@ -357,7 +357,7 @@ class PurelyRelationalPeeler(nn.Module):
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
         # Concat relative features + pairwise features
         combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
-        e = self.input_proj(rel_feats)
+        e = self.input_proj(combined)
         for block in self.blocks:
             e = block(e, mask)
         affinity_logits = self.output_head(e).squeeze(-1)

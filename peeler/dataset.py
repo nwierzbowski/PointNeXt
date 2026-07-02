@@ -175,8 +175,8 @@ class PeelerDataset(Dataset):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
 
-        N = int(rng.randint(2, self.max_fragments + 1))
-        # N = self.max_fragments
+        # N = int(rng.randint(2, self.max_fragments + 1))
+        N = self.max_fragments
         sizes, k, alpha, mu, u = self._sample_soup_partition(rng, N)
 
         soup_emb_list = []
@@ -282,7 +282,7 @@ class PeelerDataset(Dataset):
             for i in range(len(asset_fragments)):
                 asset_gid = soup_asset_gids[i]
                 n_fragments = asset_fragments[i]
-                scale = rng.uniform(asset_scale_range[0], asset_scale_range[1])
+                scale = min((rng.standard_exponential() / math.log(math.sqrt(2))) - 2, 2)
                 scale = math.pow(10, scale)
 
                 # Scale full 3x3 rotation/scale block + translation (row-major 4x4)
@@ -294,10 +294,9 @@ class PeelerDataset(Dataset):
         # Random translation augmentation: per-asset translation in world space
         translation_scale_range = self.translation_scale
         offset = 0
-        sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1], scale = 3)
+        sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
 
         cluster_scale_range = self.cluster_translation_scale
-        sigma2 = rng.lognormal(cluster_scale_range[0], cluster_scale_range[1], size=3)
 
         max_base = 3 + k // 4
         cluster_weights = np.array([0.05 + 2 ** -x for x in range(max_base)], dtype=np.float32)
@@ -316,7 +315,7 @@ class PeelerDataset(Dataset):
             n_fragments = asset_fragments[i]
 
             # Pick a base position with Dirichlet-weighted probability and add per-asset random offset
-            chosen = int(rng.choice(num_base))
+            chosen = int(rng.choice(num_base, p=cluster_probs))
             t = base_positions[chosen] + (rng.randn(3) * axis_scales_list[chosen]).astype(np.float32) * sigma
             # print("asset ", i, "pos: ", t)
             # Translation is at indices 3, 7, 11 of each row (4th column of row-major 4x4)
