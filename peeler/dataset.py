@@ -171,13 +171,27 @@ class PeelerDataset(Dataset):
             idx = 0
         return int(self._bucket_sizes[idx])
 
+    def _uniform_rotation(self, rng):
+        """Generate a uniform random 3x3 rotation matrix using Marsaglia method."""
+        axis = rng.randn(3)
+        axis /= np.linalg.norm(axis)
+        theta = rng.uniform(0, np.pi)
+        c = np.cos(theta)
+        s = np.sin(theta)
+        t = 1 - c
+        return np.array([
+            [t * axis[0] * axis[0] + c, t * axis[0] * axis[1] - s * axis[2], t * axis[0] * axis[2] + s * axis[1]],
+            [t * axis[1] * axis[0] + s * axis[2], t * axis[1] * axis[1] + c, t * axis[1] * axis[2] - s * axis[0]],
+            [t * axis[2] * axis[0] - s * axis[1], t * axis[2] * axis[1] + s * axis[0], t * axis[2] * axis[2] + c],
+        ], dtype=np.float32)
+
     def __getitem__(self, idx):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
 
         # N = int(rng.randint(2, self.max_fragments + 1))
         N = self.max_fragments
-        sizes, k, alpha, mu, u = self._sample_soup_partition(rng, N)
+        sizes, k, alpha_cluster_prob, mu, u = self._sample_soup_partition(rng, N)
 
         soup_emb_list = []
         soup_trans_list = []
@@ -216,7 +230,6 @@ class PeelerDataset(Dataset):
             total_fragments += n_fragments
             asset_fragments.append(n_fragments)
             soup_asset_gids.append(asset_gid)
-
         soup_emb = np.concatenate(soup_emb_list, axis=0)
         soup_trans = np.concatenate(soup_trans_list, axis=0)
         asset_ids = np.concatenate(asset_ids_list, axis=0)
@@ -239,40 +252,35 @@ class PeelerDataset(Dataset):
             for i in range(len(asset_fragments)):
                 n_fragments = asset_fragments[i]
                 noise = rng.randn(n_fragments, 9).astype(np.float32) * self.scaling_noise_sigma
-                # Indices 0-2 (row0), 4-6 (row1), 8-10 (row2) = rotation/scale block
-                soup_trans[offset:offset + n_fragments, 0] += noise[:, 0]  # row0 col0
-                soup_trans[offset:offset + n_fragments, 1] += noise[:, 1]  # row0 col1
-                soup_trans[offset:offset + n_fragments, 2] += noise[:, 2]  # row0 col2
-                soup_trans[offset:offset + n_fragments, 4] += noise[:, 3]  # row1 col0
-                soup_trans[offset:offset + n_fragments, 5] += noise[:, 4]  # row1 col1
-                soup_trans[offset:offset + n_fragments, 6] += noise[:, 5]  # row1 col2
-                soup_trans[offset:offset + n_fragments, 8] += noise[:, 6]  # row2 col0
-                soup_trans[offset:offset + n_fragments, 9] += noise[:, 7]  # row2 col1
-                soup_trans[offset:offset + n_fragments, 10] += noise[:, 8]  # row2 col2
+                soup_trans[offset:offset + n_fragments, 0] += noise[:, 0]
+                soup_trans[offset:offset + n_fragments, 1] += noise[:, 1]
+                soup_trans[offset:offset + n_fragments, 2] += noise[:, 2]
+                soup_trans[offset:offset + n_fragments, 4] += noise[:, 3]
+                soup_trans[offset:offset + n_fragments, 5] += noise[:, 4]
+                soup_trans[offset:offset + n_fragments, 6] += noise[:, 5]
+                soup_trans[offset:offset + n_fragments, 8] += noise[:, 6]
+                soup_trans[offset:offset + n_fragments, 9] += noise[:, 7]
+                soup_trans[offset:offset + n_fragments, 10] += noise[:, 8]
                 offset += n_fragments
 
-        # Per-asset random rotation (uniform SO(3) over all rotations)
+        # Per-asset random rotation (uniform SO(3) about centroid)
         if self.per_asset_rotation:
             offset = 0
             for i in range(len(asset_fragments)):
                 n_fragments = asset_fragments[i]
-                # Generate uniform random rotation: Marsaglia method
                 axis = rng.randn(3)
                 axis /= np.linalg.norm(axis)
                 theta = rng.uniform(0, np.pi)
-                c = np.cos(theta)
-                s = np.sin(theta)
-                t = 1 - c
+                c, s, t = np.cos(theta), np.sin(theta), 1 - np.cos(theta)
                 R = np.array([
-                    [t * axis[0] * axis[0] + c, t * axis[0] * axis[1] - s * axis[2], t * axis[0] * axis[2] + s * axis[1]],
-                    [t * axis[1] * axis[0] + s * axis[2], t * axis[1] * axis[1] + c, t * axis[1] * axis[2] - s * axis[0]],
-                    [t * axis[2] * axis[0] - s * axis[1], t * axis[2] * axis[1] + s * axis[0], t * axis[2] * axis[2] + c],
+                    [t*axis[0]**2 + c,   t*axis[0]*axis[1] - s*axis[2], t*axis[0]*axis[2] + s*axis[1]],
+                    [t*axis[1]*axis[0] + s*axis[2], t*axis[1]**2 + c,   t*axis[1]*axis[2] - s*axis[0]],
+                    [t*axis[2]*axis[0] - s*axis[1], t*axis[2]*axis[1] + s*axis[0], t*axis[2]**2 + c],
                 ], dtype=np.float32)
-                # Apply rotation to translation (indices 3, 7, 11) and rotation block (0-2, 4-6, 8-10)
-                for j in range(n_fragments):
-                    frag = soup_trans[offset + j, :12].reshape(3, 4)  # first 3 rows of 4x4
-                    frag[:, :3] = R @ frag[:, :3]  # rotate rotation block + translation
-                    soup_trans[offset + j, :12] = frag.flatten()
+                translations = soup_trans[offset:offset + n_fragments, [3, 7, 11]].astype(np.float64)
+                soup_trans[offset:offset + n_fragments, [3, 7, 11]] = (R @ translations.T).T.astype(np.float32)
+                rot_blocks = soup_trans[offset:offset + n_fragments, :12].reshape(n_fragments, 3, 4)[:, :, :3].astype(np.float64)
+                soup_trans[offset:offset + n_fragments, [0, 1, 2, 4, 5, 6, 8, 9, 10]] = (R @ rot_blocks @ R.T).astype(np.float32).reshape(n_fragments, 9)
                 offset += n_fragments
 
         # Scale normalized asset offsets by random factor (uniform range per asset)
@@ -282,11 +290,8 @@ class PeelerDataset(Dataset):
             for i in range(len(asset_fragments)):
                 asset_gid = soup_asset_gids[i]
                 n_fragments = asset_fragments[i]
-                scale = min((rng.standard_exponential() / math.log(math.sqrt(2))) - 2, 2)
+                scale = min((rng.standard_exponential() / math.log(6)) - 1, 1)
                 scale = math.pow(10, scale)
-
-                # Scale full 3x3 rotation/scale block + translation (row-major 4x4)
-                # Indices: 0-2 (row0), 4-6 (row1), 8-10 (row2) = rotation; 3,7,11 = translation
                 for idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
                     soup_trans[offset:offset + n_fragments, idx] *= scale
                 offset += n_fragments
@@ -295,30 +300,26 @@ class PeelerDataset(Dataset):
         translation_scale_range = self.translation_scale
         offset = 0
         sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
-
         cluster_scale_range = self.cluster_translation_scale
-
         max_base = 3 + k // 4
         cluster_weights = np.array([0.05 + 2 ** -x for x in range(max_base)], dtype=np.float32)
         cluster_weights /= cluster_weights.sum()
-        # print("cluster count weights: ", cluster_weights)
         num_base = int(rng.choice(max_base, p=cluster_weights)) + 1
-        # print("cluster count: ", num_base)
-        alpha = np.exp(rng.uniform(-1.0, 1.0))
-        cluster_probs = rng.dirichlet(np.full(num_base, alpha))
-        # print("cluster choice: ", cluster_probs)
-        axis_scales_list = rng.dirichlet(np.full(3, 0.5), size=num_base).astype(np.float32)
-        base_positions = rng.normal(cluster_scale_range[0], cluster_scale_range[1], size=(num_base, 3)).astype(np.float32)
-        # print("cluster locations: ", base_positions)
+        alpha_cluster_prob = np.exp(rng.uniform(-1.0, 2.0))
+        cluster_probs = rng.dirichlet(np.full(num_base, alpha_cluster_prob))
+        axis_scales_list = rng.dirichlet(np.full(3, 0.5), size = num_base).astype(np.float32)
+        base_axis_scales = rng.dirichlet(np.full(3, 0.5)).astype(np.float32)
+        base_positions = rng.uniform(cluster_scale_range[0], cluster_scale_range[1], size=(num_base, 3)).astype(np.float32) * base_axis_scales
+        R_base = self._uniform_rotation(rng)
+        base_positions = (R_base @ base_positions.T).T
+        intra_rotations = [self._uniform_rotation(rng) for _ in range(num_base)]
         for i in range(len(asset_fragments)):
             asset_gid = soup_asset_gids[i]
             n_fragments = asset_fragments[i]
-
-            # Pick a base position with Dirichlet-weighted probability and add per-asset random offset
             chosen = int(rng.choice(num_base, p=cluster_probs))
-            t = base_positions[chosen] + (rng.randn(3) * axis_scales_list[chosen]).astype(np.float32) * sigma
-            # print("asset ", i, "pos: ", t)
-            # Translation is at indices 3, 7, 11 of each row (4th column of row-major 4x4)
+            intra_offset = (rng.randn(3) * axis_scales_list[chosen]).astype(np.float32) * sigma
+            intra_offset = intra_rotations[chosen] @ intra_offset
+            t = base_positions[chosen] + intra_offset
             soup_trans[offset:offset + n_fragments, 3] += t[0]
             soup_trans[offset:offset + n_fragments, 7] += t[1]
             soup_trans[offset:offset + n_fragments, 11] += t[2]
@@ -328,16 +329,12 @@ class PeelerDataset(Dataset):
         scene_scale_range = self.scene_scale
         scene_factor = rng.uniform(scene_scale_range[0], scene_scale_range[1])
         scene_factor = math.pow(10, scene_factor)
-        
-        # Scale full 3x3 rotation/scale block + translation (row-major 4x4)
         for idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
             soup_trans[:, idx] *= scene_factor
 
         # Shuffle soup
         shuffle_idx = rng.permutation(len(soup_emb))
         soup_emb = soup_emb[shuffle_idx]
-
-        # Apply embedding noise augmentation
         if self.embedding_noise_sigma > 0:
             soup_emb = soup_emb + np.random.default_rng(self.seed + self._epoch).normal(scale=self.embedding_noise_sigma, size=soup_emb.shape).astype(soup_emb.dtype)
         soup_trans = soup_trans[shuffle_idx]
@@ -349,7 +346,6 @@ class PeelerDataset(Dataset):
 
         actual_n = len(soup_emb)
         actual_mu = sum(s * s for s in asset_fragments) / (actual_n * actual_n) if actual_n > 0 else 0.0
-
         actual_k = len(asset_fragments)
         k_min = int(np.ceil(1.0 / actual_mu))
         k_max = max(N // 6, 2)
@@ -372,7 +368,7 @@ class PeelerDataset(Dataset):
                 'actual_mu': actual_mu,
                 'actual_u': actual_u,
                 'k': k,
-                'alpha': alpha,
+                'alpha': alpha_cluster_prob,
                 'target_n': N,
                 'actual_n': actual_n,
             },

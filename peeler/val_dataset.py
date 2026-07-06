@@ -18,16 +18,16 @@ from openpoints.dataset.build import DATASETS
 class PeelerValidationDataset(Dataset):
     """Validation dataset where each TBO file = one soup.
 
-    No random sampling, no augmentation. Each soup contains all assets
-    from one TBO file, concatenated together. Y encodes same-asset
-    membership for all fragments in the soup.
+    No random sampling, no augmentation. Each soup contains up to
+    max_fragments from one TBO file, concatenated together. Y encodes
+    same-asset membership for all fragments in the soup.
 
     Args:
         all_embeddings: list of numpy arrays (N_i, 256), one per asset
         all_transforms: list of numpy arrays (N_i, 16), one per asset
         asset_to_file: list mapping asset_idx -> file_idx (groups assets by TBO file)
-        max_fragments: unused (no truncation, collate handles padding)
-        seed: unused (no randomization)
+        max_fragments: maximum fragments per soup (truncation via deterministic selection)
+        seed: seed for deterministic truncation selection
     """
 
     def __init__(
@@ -75,9 +75,20 @@ class PeelerValidationDataset(Dataset):
         soup_emb = np.concatenate(soup_emb_list, axis=0)
         soup_trans = np.concatenate(soup_trans_list, axis=0)
         asset_ids_np = np.concatenate(asset_ids_list, axis=0)
-        asset_ids = torch.from_numpy(asset_ids_np)
 
+        # Truncate to max_fragments using deterministic selection
         n = len(soup_emb)
+        max_frags = 800
+        if n > max_frags:
+            trunc_rng = np.random.RandomState(self.seed + file_idx)
+            keep = trunc_rng.choice(n, max_frags, replace=False)
+            keep.sort()
+            soup_emb = soup_emb[keep]
+            soup_trans = soup_trans[keep]
+            asset_ids_np = asset_ids_np[keep]
+            n = max_frags
+
+        asset_ids = torch.from_numpy(asset_ids_np)
 
         # Y matrix: Y[i,j] = 1 if fragments i,j belong to same asset
         Y = (asset_ids[:, None] == asset_ids[None, :])

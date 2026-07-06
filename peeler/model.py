@@ -308,11 +308,12 @@ class PurelyRelationalPeeler(nn.Module):
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.pairwise_head = nn.Sequential(
+            nn.LayerNorm(512),
             nn.Linear(512, 256),
             GeGLU(),
             nn.Dropout(pairwise_dropout),
             nn.Linear(128, _PAIRWISE_DIM),
-            nn.LayerNorm(_PAIRWISE_DIM)
+            
         )
         self.input_proj = nn.Sequential(
             nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 512),
@@ -352,7 +353,9 @@ class PurelyRelationalPeeler(nn.Module):
         emb_i = embeddings.unsqueeze(1)  # (B, 1, N, 256)
         emb_j = embeddings.unsqueeze(2)  # (B, N, 1, 256)
         abs_diff = torch.abs(emb_i - emb_j)  # (B, N, N, 256)
+        # print("deff: ", torch.max(abs_diff), torch.min(abs_diff))
         prod = emb_i * emb_j  # (B, N, N, 256)
+        # print("prod: ", torch.max(prod), torch.min(prod))
         pairwise_feats = torch.cat([abs_diff, prod], dim=-1)  # (B, N, N, 512)
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
         # Concat relative features + pairwise features
