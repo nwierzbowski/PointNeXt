@@ -21,6 +21,46 @@ from openpoints.models.build import MODELS
 TRANSFORM_DIM = 6
 
 
+class StableLayerNorm(nn.Module):
+    """LayerNorm with variance + eps for ONNX numerical stability.
+
+    Matches PyTorch's nn.LayerNorm: (x - mean) / sqrt(var + eps).
+    Using var + eps instead of clamp(var, min=eps) avoids ONNX Clip nodes
+    with tensor inputs that cause NaN in ONNX Runtime's CUDA provider.
+
+    Uses the same parameters as nn.LayerNorm for drop-in compatibility.
+    """
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, bias=True):
+        super().__init__()
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if isinstance(normalized_shape, int):
+            self.normalized_shape = (normalized_shape,)
+            self.num_features = normalized_shape
+        else:
+            self.normalized_shape = tuple(normalized_shape)
+            self.num_features = normalized_shape[-1]
+
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(self.num_features))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(self.num_features))
+            else:
+                self.register_parameter('bias', None)
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var.relu() + self.eps)
+        if self.elementwise_affine:
+            x = x * self.weight + self.bias
+        return x
+
+
 
 def transforms_to_pose(transforms, mask):
     """Extract translation, scale, and normalized rotation from 4x4 transforms.
@@ -38,7 +78,7 @@ def transforms_to_pose(transforms, mask):
     mat = transforms.view(B, N, 4, 4)
     translation = mat[:, :, :3, 3]
     scale = torch.norm(mat[:, :, :3, :3], dim=-1).mean(-1, keepdim=True)
-    scale = torch.clamp(scale, min=1e-8)
+    scale = scale + 1e-8
     rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
 
     mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
@@ -64,23 +104,6 @@ def transforms_to_pose(transforms, mask):
 
     return active_translation, scale, rot
 
-
-def compute_transform_features(translation, scale):
-    """Compute transform features for anchor scoring.
-
-    Args:
-        translation: (B, N, 3) normalized translation
-        scale: (B, N, 1) normalized scale
-
-    Returns:
-        features: (B, N, 6) concatenated transform features
-    """
-    distance = torch.norm(translation, dim=-1, keepdim=True)
-    norm_dist = torch.log10(torch.clamp(distance / scale, min=1e-8)) / 7
-    dir = torch.where(distance > 1e-8, translation / distance, torch.zeros_like(translation))
-    distance = (torch.log10(torch.clamp(distance, min=1e-3)) + 3) / 4
-    norm_scale = (torch.log10(scale)) / 6
-    return torch.cat([distance, norm_dist, dir, norm_scale], dim=-1)
 
 
 def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot):
@@ -130,18 +153,18 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     # print("min: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
 
     return torch.cat([
-        torch.where(dist_raw > 1e-8, diff / dist_raw, torch.zeros_like(diff)),  # direction (3)
-        (torch.log10(torch.clamp(dist_raw, min=1e-8)) / 8) + 1,                  # dist (1)
-        (torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8) + 1,  # dist_bwn (1)
-        (torch.log10(torch.clamp((torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8)) / seed_S_exp, min=1e-8)) / 8),  # dist_bwn_normalized_s (1)
-        (torch.log10(torch.clamp((torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8)) / cand_S_exp, min=1e-8)) / 8),  # dist_bwn_normalized_c (1)
-        (torch.log10(torch.clamp(dist_raw / seed_S_exp, min=1e-8)) / 8),          # dist_normalized_s (1)
-        (torch.log10(torch.clamp(dist_raw / cand_S_exp, min=1e-8)) / 8),          # dist_normalized_c (1)
-        (torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 6),                      # seed_S_log (1)
-        (torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 6),                      # cand_S_log (1)
-        (torch.log10(cand_S_exp / seed_S_exp) / 8),                                # rel_scale (1)
-        rot_diff,                                                                  # rot_diff (9)
-        rot_cosine,                                                                # rot_cosine (1)
+        diff / (dist_raw.relu() + 1e-8),  # direction (3) - safe division
+        (torch.log10(dist_raw + 1e-8) / 8) + 1,                                  # dist (1)
+        (torch.log10((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / 8) + 1,  # dist_bwn (1)
+        (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / seed_S_exp) / 8),  # dist_bwn_normalized_s (1)
+        (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / cand_S_exp) / 8),  # dist_bwn_normalized_c (1)
+        (torch.log10(dist_raw / seed_S_exp + 1e-8) / 8),                        # dist_normalized_s (1)
+        (torch.log10(dist_raw / cand_S_exp + 1e-8) / 8),                        # dist_normalized_c (1)
+        (torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 6),                    # seed_S_log (1)
+        (torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 6),                    # cand_S_log (1)
+        (torch.log10(cand_S_exp / seed_S_exp) / 8),                             # rel_scale (1)
+        rot_diff,                                                               # rot_diff (9)
+        rot_cosine,                                                             # rot_cosine (1)
     ], dim=-1)
 
 _REL_FEATURE_DIM = 22
@@ -237,7 +260,7 @@ class PurelyRelationalBlock(nn.Module):
             GeGLU(),
         )
         self.proj_up = nn.Sequential(
-            nn.LayerNorm(target_dim),
+            StableLayerNorm(target_dim),
             nn.Linear(target_dim, target_dim * 4),
             GeGLU(),
             nn.Linear(target_dim * 2, highway_dim)
@@ -270,7 +293,7 @@ class MLPBlock(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(highway_dim, target_dim * 2),
-            nn.LayerNorm(target_dim * 2),
+            StableLayerNorm(target_dim * 2),
             GeGLU(),
             nn.Linear(target_dim, highway_dim)
         )
@@ -308,7 +331,7 @@ class PurelyRelationalPeeler(nn.Module):
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.pairwise_head = nn.Sequential(
-            nn.LayerNorm(512),
+            StableLayerNorm(512),
             nn.Linear(512, 256),
             GeGLU(),
             nn.Dropout(pairwise_dropout),

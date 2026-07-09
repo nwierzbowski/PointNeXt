@@ -1,7 +1,24 @@
 from torch import nn
 import torch
 
-from peeler.model import _REL_FEATURE_DIM, TRANSFORM_DIM, compute_relative_features, compute_transform_features, transforms_to_pose
+from peeler.model import StableLayerNorm, _REL_FEATURE_DIM, TRANSFORM_DIM, compute_relative_features, transforms_to_pose
+
+def compute_transform_features(translation, scale):
+    """Compute transform features for anchor scoring.
+
+    Args:
+        translation: (B, N, 3) normalized translation
+        scale: (B, N, 1) normalized scale
+
+    Returns:
+        features: (B, N, 6) concatenated transform features
+    """
+    distance = torch.norm(translation, dim=-1, keepdim=True)
+    norm_dist = torch.log10(torch.clamp(distance / scale, min=1e-8)) / 7
+    dir = translation / (distance.relu() + 1e-8)
+    distance = (torch.log10(torch.clamp(distance, min=1e-3)) + 3) / 4
+    norm_scale = (torch.log10(scale)) / 6
+    return torch.cat([distance, norm_dist, dir, norm_scale], dim=-1)
 
 
 class SimpleAttentionBlock(nn.Module):
@@ -13,7 +30,7 @@ class SimpleAttentionBlock(nn.Module):
 
     def __init__(self, dim, num_heads):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = StableLayerNorm(dim)
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
@@ -24,7 +41,7 @@ class SimpleAttentionBlock(nn.Module):
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
 
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = StableLayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * 2),
             nn.GELU(),
@@ -115,7 +132,7 @@ class PeelerBackbone(nn.Module):
             SimpleAttentionBlock(self.feat_dim, attention_heads)
             for _ in range(attention_blocks)
         ])
-        self.norm = nn.LayerNorm(self.feat_dim)
+        self.norm = StableLayerNorm(self.feat_dim)
 
     
 
