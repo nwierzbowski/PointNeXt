@@ -48,6 +48,7 @@ class PeelerDataset(Dataset):
         asset_scale_std,
         scene_scale,
         cluster_translation_scale,
+        scene_transforms,
         embedding_noise_sigma=0.0,
         translation_noise_sigma=0.0,
         scaling_noise_sigma=0.0,
@@ -55,6 +56,7 @@ class PeelerDataset(Dataset):
     ):
         self.all_embeddings = all_embeddings  # list of (N_i, 256)
         self.all_transforms = all_transforms  # list of (N_i, 16)
+        self.scene_transforms = scene_transforms  # list of (N_i, 16) from transforms TBO
         self.max_fragments = max_fragments
         self.translation_scale = translation_scale
         self.asset_scale_std = asset_scale_std

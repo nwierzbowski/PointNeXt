@@ -18,13 +18,14 @@ def get_device(device):
     return torch.device(device)
 
 
-def build_peeler_dataset(cfg, all_embeddings, all_transforms):
+def build_peeler_dataset(cfg, all_embeddings, all_transforms, scene_transforms):
     """Build PeelerDataset from TBO data.
 
     Args:
         cfg: EasyConfig with dataset settings
         all_embeddings: list of numpy arrays (N_i, 256), one per asset
         all_transforms: list of numpy arrays (N_i, 16), one per asset
+        scene_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
 
     Returns:
         PeelerDataset instance
@@ -34,6 +35,7 @@ def build_peeler_dataset(cfg, all_embeddings, all_transforms):
     return PeelerDataset(
         all_embeddings=all_embeddings,
         all_transforms=all_transforms,
+        scene_transforms=scene_transforms,
         max_fragments=dataset_cfg.get('max_fragments', 700),
         seed=dataset_cfg.get('seed', 42),
         translation_scale=dataset_cfg.get('translation_scale', 0.0),
@@ -107,7 +109,7 @@ def setup(
     checkpoint_path=None,
     yaml_content=None,
     log_callback=None,
-    trans_train_transforms=None,
+    scene_transforms=None,
     test_embeddings=None,
     test_transforms=None,
     test_asset_to_file=None,
@@ -122,7 +124,7 @@ def setup(
         mode: 'train'
         yaml_content: YAML config string from checkpoint
         log_callback: callable(str) for progress logging
-        trans_train_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
+        scene_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
         test_embeddings: list of numpy arrays (N_i, 256), one per test asset
         test_transforms: list of numpy arrays (N_i, 16), one per test asset
         test_asset_to_file: list mapping test asset_idx -> file_idx for validation soups
@@ -149,7 +151,7 @@ def setup(
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
 
     # Build train dataset
-    train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms)
+    train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms, scene_transforms)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
