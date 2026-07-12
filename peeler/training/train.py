@@ -163,14 +163,9 @@ def _train(
                 step_loss_accum = 0.0
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-                model_name = type(model).__name__
-                if model_name == 'PurelyRelationalPeeler':
-                    Y = batch['Y'].to(device, dtype=torch.float32, non_blocking=True)
-                    affinity_logits = model(embeddings, transforms, mask)
-                    loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
-                else:
-                    refined_emb = model(embeddings, transforms, mask)
-                    loss, loss_dict = criterion(refined_emb, asset_ids, mask, epoch, num_epochs)
+                Y = batch['Y'].to(device, dtype=torch.float32, non_blocking=True)
+                affinity_logits = model(embeddings, transforms, mask)
+                loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
 
             step_loss_accum += loss.item()
 

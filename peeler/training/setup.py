@@ -40,7 +40,7 @@ def build_peeler_dataset(cfg, all_embeddings, all_transforms):
         cluster_translation_scale=dataset_cfg.get('cluster_translation_scale', [1.6, 0.7]),
         asset_scale_std=dataset_cfg.get('asset_scale_std', 1.0),
         scene_scale=dataset_cfg.get('scene_scale', [0.8, 1.2]),
-        embedding_noise_sigma=cfg.get('embedding_noise_sigma', 0.0),
+        embedding_noise_sigma=dataset_cfg.get('embedding_noise_sigma', 0.0),
         translation_noise_sigma=dataset_cfg.get('translation_noise_sigma', 0.0),
         scaling_noise_sigma=dataset_cfg.get('scaling_noise_sigma', 0.0),
         per_asset_rotation=dataset_cfg.get('per_asset_rotation', True),
@@ -105,9 +105,9 @@ def setup(
     all_transforms,
     config_path,
     checkpoint_path=None,
-    mode='train',
     yaml_content=None,
     log_callback=None,
+    trans_train_transforms=None,
     test_embeddings=None,
     test_transforms=None,
     test_asset_to_file=None,
@@ -122,6 +122,7 @@ def setup(
         mode: 'train'
         yaml_content: YAML config string from checkpoint
         log_callback: callable(str) for progress logging
+        trans_train_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
         test_embeddings: list of numpy arrays (N_i, 256), one per test asset
         test_transforms: list of numpy arrays (N_i, 16), one per test asset
         test_asset_to_file: list mapping test asset_idx -> file_idx for validation soups

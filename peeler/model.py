@@ -1,14 +1,11 @@
-"""Peeler - Attention backbone with relational bias for fragment clustering.
+"""Peeler - Purely relational architecture for fragment clustering.
 
 Architecture:
-    PeelerBackbone: embedding projection → self-attention with pairwise relational bias
     PurelyRelationalBlock: bottleneck triangular update with fixed highway
-    
-    Peeler: backbone + projection for clustering
     PurelyRelationalPeeler: affinity logits output for BCE training
 
-Training: Aligned Pull-Push clustering loss with curriculum ramp.
-Optimization: End-to-end training of attention backbone.
+Training: BCE loss on same-asset affinity matrix.
+Optimization: End-to-end training of relational blocks.
 
 Registered with openpoints MODELS registry.
 """
@@ -16,9 +13,6 @@ import torch
 import torch.nn as nn
 
 from openpoints.models.build import MODELS
-
-
-TRANSFORM_DIM = 6
 
 
 class StableLayerNorm(nn.Module):
@@ -168,63 +162,6 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     ], dim=-1)
 
 _REL_FEATURE_DIM = 22
-
-@MODELS.register_module()
-class Peeler(nn.Module):
-    """Peeler model with attention backbone for fragment clustering.
-
-    Architecture:
-        1. PeelerBackbone: embedding projection + self-attention with pairwise relational bias
-        2. Projection: to output dimension for clustering
-
-    Input: embeddings(B,N,feat_dim), transforms(B,N,16), mask(B,N)
-    Output: refined_embeddings(B,N,gcn_out_dim)
-
-    Training: Aligned Pull-Push clustering loss with curriculum ramp.
-    Inference: embeddings clusterable with DBSCAN.
-    """
-
-    def __init__(self,
-                   feat_dim,
-                   attention_heads,
-                   attention_blocks,
-                   gcn_out_dim,
-                   **kwargs):
-        super().__init__()
-        self.feat_dim = feat_dim
-
-        # 1. Attention backbone: produces embeddings for clustering
-        from peeler.attention_backbone import PeelerBackbone
-        self.backbone = PeelerBackbone(feat_dim, feat_dim, attention_heads, attention_blocks)
-        self.gcn_proj = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim // 2),
-            nn.GELU(),
-            nn.Linear(feat_dim // 2, feat_dim // 4),
-            nn.GELU(),
-            nn.Linear(feat_dim // 4, gcn_out_dim),
-        )
-
-    def forward(self, embeddings, transforms, mask):
-        """Forward pass.
-
-        Args:
-            embeddings: (B, N, feat_dim) - fragment embeddings from backbone
-            transforms: (B, N, 16) - fragment transforms (4x4 pose matrices flattened)
-            mask: (B, N) - 1 for real fragments, 0 for padding
-
-        Returns:
-            refined_emb: (B, N, gcn_out_dim) - clusterable embeddings
-        """
-        B, N, _ = embeddings.shape
-
-        # 1. Attention backbone refinement
-        refined_emb = self.backbone(transforms, mask, embeddings)
-
-        # 2. Project to output dimension
-        refined_emb = self.gcn_proj(refined_emb)
-        refined_emb = refined_emb * mask.unsqueeze(-1)
-
-        return refined_emb
 
 class GeGLU(nn.Module):
     """

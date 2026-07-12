@@ -214,54 +214,42 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs, th
             Y = batch['Y'].to(device).float()
             asset_ids = batch['asset_ids'].to(device, dtype=torch.long)
 
-            model_name = type(model).__name__
-            if model_name == 'PurelyRelationalPeeler':
-                affinity_logits = model(embeddings, transforms, mask)
-                loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
+            affinity_logits = model(embeddings, transforms, mask)
+            loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
 
-                # F1 on raw thresholded adjacency
-                pred_adj = (torch.sigmoid(affinity_logits) > 0.5).float()
-                tp, fp, fn = _f1_score_batch(Y, pred_adj, mask)
-                tp_sum += tp
-                fp_sum += fp
-                fn_sum += fn
+            # F1 on raw thresholded adjacency
+            pred_adj = (torch.sigmoid(affinity_logits) > 0.5).float()
+            tp, fp, fn = _f1_score_batch(Y, pred_adj, mask)
+            tp_sum += tp
+            fp_sum += fp
+            fn_sum += fn
 
-                # Average-Linkage clustering for cluster-level metrics
-                soft_A = torch.sigmoid(affinity_logits).cpu().numpy()
-                mask_np = mask.cpu().numpy()
-                Y_np = Y.cpu().numpy()
+            # Average-Linkage clustering for cluster-level metrics
+            soft_A = torch.sigmoid(affinity_logits).cpu().numpy()
+            mask_np = mask.cpu().numpy()
+            Y_np = Y.cpu().numpy()
 
-                B = soft_A.shape[0]
-                for b in range(B):
-                    active_indices = np.where(mask_np[b] > 0.5)[0]
-                    if len(active_indices) < 2:
-                        continue
+            B = soft_A.shape[0]
+            for b in range(B):
+                active_indices = np.where(mask_np[b] > 0.5)[0]
+                if len(active_indices) < 2:
+                    continue
 
-                    b_affinities = soft_A[b][active_indices][:, active_indices]
-                    b_gt_matrix = Y_np[b][active_indices][:, active_indices]
+                b_affinities = soft_A[b][active_indices][:, active_indices]
+                b_gt_matrix = Y_np[b][active_indices][:, active_indices]
 
-                    # Ground-truth labels from Y matrix
-                    gt_labels = _gt_connected_components(
-                        torch.from_numpy(b_gt_matrix).unsqueeze(0).float().to(device),
-                        torch.from_numpy((mask_np[b][active_indices] > 0.5).astype(np.float32)).unsqueeze(0).to(device)
-                    )
-                    gt_labels = gt_labels[0, :len(active_indices)].cpu().numpy()
+                # Ground-truth labels from Y matrix
+                gt_labels = _gt_connected_components(
+                    torch.from_numpy(b_gt_matrix).unsqueeze(0).float().to(device),
+                    torch.from_numpy((mask_np[b][active_indices] > 0.5).astype(np.float32)).unsqueeze(0).to(device)
+                )
+                gt_labels = gt_labels[0, :len(active_indices)].cpu().numpy()
 
-                    # Predicted labels via Average-Linkage
-                    pred_labels = _cluster_with_average_linkage(b_affinities, threshold=threshold)
+                # Predicted labels via Average-Linkage
+                pred_labels = _cluster_with_average_linkage(b_affinities, threshold=threshold)
 
-                    ari_sum += adjusted_rand_score(gt_labels, pred_labels)
-                    batch_count += 1
-            else:
-                refined_emb = model(embeddings, transforms, mask)
-                loss, loss_dict = criterion(refined_emb, asset_ids, mask, epoch, num_epochs)
-
-                pred_labels = _dbscan_embeddings(refined_emb, mask, eps=0.5, min_samples=2)
-                gt_labels = _gt_connected_components(Y, mask)
-
-                ari_batch, cnt_batch = _ari_batch(gt_labels, pred_labels, mask)
-                ari_sum += ari_batch
-                batch_count += cnt_batch
+                ari_sum += adjusted_rand_score(gt_labels, pred_labels)
+                batch_count += 1
 
             total_loss += loss.item()
 
