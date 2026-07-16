@@ -58,7 +58,7 @@ class AugmentationEngine:
         
         # 0-------------1
         # synth-----scene
-        synth_prob = 1
+        synth_prob = 0.9
         
         # 50/50 choice between scene transforms and cluster translation
         if rng.random() > synth_prob:

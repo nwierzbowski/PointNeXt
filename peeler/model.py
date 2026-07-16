@@ -135,9 +135,9 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
 
     return torch.cat([
         direction_local,  # direction (3) - safe division
-        (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / seed_S_exp) / 8),  # dist_bwn_normalized_s (1)
-        (torch.log10(dist_raw / seed_S_exp + 1e-8) / 8),                        # dist_normalized_s (1)
-        (torch.log10(cand_S_exp / seed_S_exp) / 8),                             # rel_scale (1)
+        (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / (seed_S_exp + 1e-8)) / 8),  # dist_bwn_normalized_s (1)
+        (torch.log10(dist_raw / (seed_S_exp + 1e-8) + 1e-8) / 8),                        # dist_normalized_s (1)
+        (torch.log10(cand_S_exp / (seed_S_exp + 1e-8) + 1e-8) / 8),                             # rel_scale (1)
         rot_diff,                                                               # rot_diff (9)
         rot_cosine,                                                             # rot_cosine (1)
     ], dim=-1)
@@ -178,7 +178,7 @@ class PurelyRelationalBlock(nn.Module):
             SwiGLU()
         )
         self.proj_up = nn.Sequential(
-            StableRMSNorm(target_dim),
+            # StableRMSNorm(target_dim),
             nn.Linear(target_dim, highway_dim)
         )
 
@@ -222,7 +222,7 @@ class MLPBlock(nn.Module):
         return e + result
 
 
-_PAIRWISE_DIM = 48
+_PAIRWISE_DIM = 48 * 2
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
@@ -252,10 +252,17 @@ class PurelyRelationalPeeler(nn.Module):
             SwiGLU(),
             nn.Linear(256, _PAIRWISE_DIM),
         )
-        self.input_proj = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, (_REL_FEATURE_DIM + _PAIRWISE_DIM) * 2),
+
+        self.rel_head = nn.Sequential(
+            nn.Linear(_REL_FEATURE_DIM, 64),
             SwiGLU(),
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, highway_dim)
+            nn.Linear(32, _REL_FEATURE_DIM * 2)
+        )
+        self.input_proj = nn.Sequential(
+            nn.Linear(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM, (_REL_FEATURE_DIM* 2 + _PAIRWISE_DIM) * 2),
+            SwiGLU(),
+            StableRMSNorm(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM),
+            nn.Linear(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM, highway_dim),
         )
         self.blocks = nn.ModuleList()
         for i, target_dim in enumerate(self.downsample_schedule):
@@ -307,6 +314,7 @@ class PurelyRelationalPeeler(nn.Module):
 
         pairwise_feats = torch.cat([abs_diff, emb_i - emb_j], dim=-1)  # (B, N, N, 512)
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
+        rel_feats = self.rel_head(rel_feats)
         
         # Concat relative features + pairwise features
         combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
