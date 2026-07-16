@@ -9,22 +9,23 @@ Optimization: End-to-end training of relational blocks.
 
 Registered with openpoints MODELS registry.
 """
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from openpoints.models.build import MODELS
 
 
-class StableLayerNorm(nn.Module):
-    """LayerNorm with variance + eps for ONNX numerical stability.
+class StableRMSNorm(nn.Module):
+    """Stable RMSNorm with clean variance + eps for ONNX and compiling.
 
-    Matches PyTorch's nn.LayerNorm: (x - mean) / sqrt(var + eps).
-    Using var + eps instead of clamp(var, min=eps) avoids ONNX Clip nodes
-    with tensor inputs that cause NaN in ONNX Runtime's CUDA provider.
-
-    Uses the same parameters as nn.LayerNorm for drop-in compatibility.
+    Matches PyTorch's native nn.RMSNorm behavior (scaling-only, no bias) 
+    but remains fully exportable on older ONNX Opsets (like Opset 15/17) 
+    and highly optimized for compile.
     """
-    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, bias=True):
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
         super().__init__()
         self.eps = eps
         self.elementwise_affine = elementwise_affine
@@ -38,21 +39,22 @@ class StableLayerNorm(nn.Module):
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(self.num_features))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(self.num_features))
-            else:
-                self.register_parameter('bias', None)
         else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+            self.register_parameter('rmsnorm_weight', None)
 
     def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x = (x - mean) / torch.sqrt(var.relu() + self.eps)
+        # 1. Compute variance (mean of squares) along the last dimension.
+        # No subtraction means zero risk of subtractive cancellation (no NaNs).
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        
+        # 2. Scale via rsqrt (which compiles into a single fused CUDA kernel)
+        x_normed = x * torch.rsqrt(variance + self.eps)
+        
+        # 3. Apply the learnable scale (gamma)
         if self.elementwise_affine:
-            x = x * self.weight + self.bias
-        return x
+            x_normed = x_normed * self.weight
+                
+        return x_normed
 
 
 
@@ -76,25 +78,8 @@ def transforms_to_pose(transforms, mask):
     rot = mat[:, :, :3, :3].reshape(B, N, -1) / scale
 
     mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
-    # num_active = mask_expanded.sum(dim=1, keepdim=True)  # (B, 1, 1)
 
     active_translation = translation * mask_expanded
-    # center = active_translation.sum(dim=1, keepdim=True) / (num_active + 1e-8)
-
-    # relative_translation = (translation - center) * mask_expanded
-
-    # Normalize by average distance per batch
-    # active_scales_sum = (scale * mask_expanded).sum(dim=1, keepdim=True)  # (B, 1, 1)
-    # avg_distance = active_scales_sum / (num_active + 1e-8)  # (B, 1, 1)
-
-    # Break degeneracy: when all positions are identical, add small deterministic
-    # per-fragment perturbation based on fragment index. ONNX-compatible (no randomness).
-    # indices = torch.arange(N, device=transforms.device, dtype=torch.float32)
-    # perturbation = torch.sin(indices.unsqueeze(-1) * 0.1) * 1e-4  # (N, 3)
-    # relative_translation = relative_translation + perturbation.unsqueeze(0)  # broadcast to (B, N, 3)
-    
-    # relative_translation = relative_translation / avg_distance
-    # scale = scale / avg_distance
 
     return active_translation, scale, rot
 
@@ -143,27 +128,23 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2] # (B, S, N)
     rot_cosine = (trace / 3.0).unsqueeze(-1)                      # (B, S, N, 1)
 
+    direction_local = torch.matmul(R_seed_T, (diff / (dist_raw.relu() + 1e-8)).unsqueeze(-1)).squeeze(-1) # (B, S, N, 3)
+
     # print("max: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
     # print("min: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
 
     return torch.cat([
-        diff / (dist_raw.relu() + 1e-8),  # direction (3) - safe division
-        (torch.log10(dist_raw + 1e-8) / 8) + 1,                                  # dist (1)
-        (torch.log10((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / 8) + 1,  # dist_bwn (1)
+        direction_local,  # direction (3) - safe division
         (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / seed_S_exp) / 8),  # dist_bwn_normalized_s (1)
-        (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / cand_S_exp) / 8),  # dist_bwn_normalized_c (1)
         (torch.log10(dist_raw / seed_S_exp + 1e-8) / 8),                        # dist_normalized_s (1)
-        (torch.log10(dist_raw / cand_S_exp + 1e-8) / 8),                        # dist_normalized_c (1)
-        (torch.log10(seed_S_exp.expand(-1, -1, N, -1)) / 6),                    # seed_S_log (1)
-        (torch.log10(cand_S_exp.expand(-1, S, -1, -1)) / 6),                    # cand_S_log (1)
         (torch.log10(cand_S_exp / seed_S_exp) / 8),                             # rel_scale (1)
         rot_diff,                                                               # rot_diff (9)
         rot_cosine,                                                             # rot_cosine (1)
     ], dim=-1)
 
-_REL_FEATURE_DIM = 22
+_REL_FEATURE_DIM = 16
 
-class GeGLU(nn.Module):
+class SwiGLU(nn.Module):
     """
     ONNX-safe Gated Linear Unit with GELU activation.
     Splits the last dimension in half and uses one half to gate the other.
@@ -185,34 +166,33 @@ class PurelyRelationalBlock(nn.Module):
 
     def __init__(self, highway_dim, target_dim):
         super().__init__()
+
+        self.norm = StableRMSNorm(highway_dim)
         
         self.left_proj = nn.Sequential(
             nn.Linear(highway_dim, target_dim * 2),
-            # nn.LayerNorm(target_dim * 2),
-            GeGLU(),
+            SwiGLU()
         )
         self.right_proj = nn.Sequential(
             nn.Linear(highway_dim, target_dim * 2),
-            # nn.LayerNorm(target_dim * 2),
-            GeGLU(),
+            SwiGLU()
         )
         self.proj_up = nn.Sequential(
-            StableLayerNorm(target_dim),
-            nn.Linear(target_dim, target_dim * 4),
-            GeGLU(),
-            nn.Linear(target_dim * 2, highway_dim)
+            StableRMSNorm(target_dim),
+            nn.Linear(target_dim, highway_dim)
         )
 
     def forward(self, e, mask):
         B, N, _, D = e.shape
-        left = self.left_proj(e)
-        right = self.right_proj(e)
+        norm = self.norm(e)
+        left = self.left_proj(norm)
+        right = self.right_proj(norm)
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
         left = left * mask_2d
         right = right * mask_2d
         left_perm = left.permute(0, 3, 1, 2)
         right_perm = right.permute(0, 3, 1, 2)
-        triangular_sum = torch.matmul(left_perm, right_perm)
+        triangular_sum = torch.matmul(left_perm, right_perm) / math.sqrt(75)
         triangular_out = triangular_sum.permute(0, 2, 3, 1)
         result = self.proj_up(triangular_out)
         result = result * mask_2d
@@ -229,9 +209,9 @@ class MLPBlock(nn.Module):
     def __init__(self, highway_dim, target_dim):
         super().__init__()
         self.mlp = nn.Sequential(
+            StableRMSNorm(highway_dim),
             nn.Linear(highway_dim, target_dim * 2),
-            StableLayerNorm(target_dim * 2),
-            GeGLU(),
+            SwiGLU(),
             nn.Linear(target_dim, highway_dim)
         )
 
@@ -242,7 +222,7 @@ class MLPBlock(nn.Module):
         return e + result
 
 
-_PAIRWISE_DIM = 42
+_PAIRWISE_DIM = 48
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
@@ -268,17 +248,14 @@ class PurelyRelationalPeeler(nn.Module):
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.pairwise_head = nn.Sequential(
-            StableLayerNorm(512),
-            nn.Linear(512, 256),
-            GeGLU(),
-            nn.Dropout(pairwise_dropout),
-            nn.Linear(128, _PAIRWISE_DIM),
-            
+            nn.Linear(512, 512),
+            SwiGLU(),
+            nn.Linear(256, _PAIRWISE_DIM),
         )
         self.input_proj = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, 512),
-            GeGLU(),
-            nn.Linear(256, highway_dim)
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, (_REL_FEATURE_DIM + _PAIRWISE_DIM) * 2),
+            SwiGLU(),
+            nn.Linear(_REL_FEATURE_DIM + _PAIRWISE_DIM, highway_dim)
         )
         self.blocks = nn.ModuleList()
         for i, target_dim in enumerate(self.downsample_schedule):
@@ -286,8 +263,9 @@ class PurelyRelationalPeeler(nn.Module):
             if self.mlp_sizes[i] > 0:
                 self.blocks.append(MLPBlock(highway_dim, target_dim))
         self.output_head = nn.Sequential(
-            nn.Linear(highway_dim, 128),
-            GeGLU(),
+            StableRMSNorm(highway_dim),
+            nn.Linear(highway_dim, 64),
+            nn.GELU(),
             nn.Linear(64, 1)
         )
 
@@ -305,22 +283,37 @@ class PurelyRelationalPeeler(nn.Module):
         B, N, _ = transforms.shape
         translation, scale, rot = transforms_to_pose(transforms, mask)
         rel_feats = compute_relative_features(
-            translation, scale.view(B, N),
+            translation, scale.squeeze(-1),
             translation, scale.squeeze(-1),
             rot, rot
         )
+
+        # print("rel_feats: ", torch.max(rel_feats), torch.min(rel_feats))
+
+        # norm_embeddings = F.normalize(embeddings, p=2, dim=-1, eps=1e-8)
+        norm_embeddings = embeddings / 6
+        norm_embeddings = torch.clamp(norm_embeddings, max=2, min=-2)
+        # print("norm_embeddings: ", torch.max(norm_embeddings), torch.min(norm_embeddings))
+
         # Pairwise from embeddings: |e_i - e_j| and e_i * e_j
-        emb_i = embeddings.unsqueeze(1)  # (B, 1, N, 256)
-        emb_j = embeddings.unsqueeze(2)  # (B, N, 1, 256)
+        emb_i = norm_embeddings.unsqueeze(1)  # (B, 1, N, 256)
+        emb_j = norm_embeddings.unsqueeze(2)  # (B, N, 1, 256)
+
         abs_diff = torch.abs(emb_i - emb_j)  # (B, N, N, 256)
-        # print("deff: ", torch.max(abs_diff), torch.min(abs_diff))
+        # print("abs_diff: ", torch.max(abs_diff), torch.min(abs_diff))
+
         prod = emb_i * emb_j  # (B, N, N, 256)
         # print("prod: ", torch.max(prod), torch.min(prod))
-        pairwise_feats = torch.cat([abs_diff, prod], dim=-1)  # (B, N, N, 512)
+
+        pairwise_feats = torch.cat([abs_diff, emb_i - emb_j], dim=-1)  # (B, N, N, 512)
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
+        
         # Concat relative features + pairwise features
         combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
         e = self.input_proj(combined)
+
+        # print("e: ", torch.max(e), torch.min(e))
+        
         for block in self.blocks:
             e = block(e, mask)
         affinity_logits = self.output_head(e).squeeze(-1)

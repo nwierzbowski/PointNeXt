@@ -4,26 +4,26 @@ criterion:
 dataset:
   asset_scale_std:
   - 0.0
-  - 0.56
+  - 0.01
   cluster_translation_scale:
   - -30.0
   - 30.0
   max_fragments: 150
   per_asset_rotation: true
-  scaling_noise_sigma: 0.001
+  scaling_noise_sigma: 0.0
   scene_scale:
   - 0.0
   - 0.0
   seed: 42
-  translation_noise_sigma: 0.001
+  translation_noise_sigma: 0.0
   translation_scale:
-  - -1.0
-  - 0.7
-embedding_noise_sigma: 0.5
+  - 0.0
+  - 0.002
+embedding_noise_sigma: 0.0
 epochs: 20
 grad_accum_steps: 8
-lr: 0.01
-lr_pct_start: 0.5
+lr: 0.003
+lr_pct_start: 0.1
 model:
   NAME: PurelyRelationalPeeler
   downsample_schedule:
@@ -50,8 +50,8 @@ optimizer:
   NAME: adamw
   weight_decay: 0.035
 scheduler:
-  div: 10.0
-  final_div_factor: 10000.0
+  div: 100.0
+  final_div_factor: 10.0
 training:
   device: cuda
   ema_alpha: 0.1

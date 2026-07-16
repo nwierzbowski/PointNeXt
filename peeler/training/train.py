@@ -180,8 +180,8 @@ def _train(
             if is_accum_end:
                 if use_amp:
                     scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+                # print(f"[GRAD] clipped_norm={grad_norm_before_clip:.4f}")
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()

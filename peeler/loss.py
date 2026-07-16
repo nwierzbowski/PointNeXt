@@ -136,27 +136,28 @@ class AlignedPullPushPeelerLoss(nn.Module):
         return pull_loss, push_loss
 
 
+
 @LOSS.register_module()
 class BCEAffinityPeelerLoss(nn.Module):
     """BCE loss on pairwise affinity logits for purely relational peeler.
 
     Computes binary cross-entropy between predicted affinity logits and
     ground truth same-asset matrix Y, masked to exclude padding pairs
-    and self-pairs.
+    and self-pairs. Dynamically balances positive/negative classes per-sample.
     """
 
     def __init__(self, **kwargs):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
-    def forward(self, affinity_logits, Y, mask, epoch, num_epochs):
+    def forward(self, affinity_logits, Y, mask, epoch=None, num_epochs=None):
         """
         Args:
             affinity_logits: (B, N, N) - predicted affinity logits
             Y: (B, N, N) - ground truth same-asset matrix (0/1)
             mask: (B, N) - 1 for real fragments, 0 for padding
-            epoch: current epoch number (int)
-            num_epochs: total target epochs (int)
+            epoch: current epoch number (optional)
+            num_epochs: total target epochs (optional)
 
         Returns:
             loss: scalar total loss
@@ -167,28 +168,43 @@ class BCEAffinityPeelerLoss(nn.Module):
         diag_mask = 1.0 - torch.eye(N, device=Y.device).unsqueeze(0)  # (1, N, N)
         valid_mask = valid * diag_mask  # (B, N, N)
 
-        # Per-element BCE
-        bce_per_element = self.bce(affinity_logits, Y)  # (B, N, N)
+        # 1. Compute raw, unweighted per-element BCE
+        bce_per_element = self.bce(affinity_logits, Y * 0.9 + 0.05)  # (B, N, N)
 
-        # Dynamic class weights from ground truth Y (inverse-frequency normalization)
-        n_pos = (Y * valid_mask).sum(dim=(1, 2)).mean()  # scalar avg across batch
-        total_active = valid_mask.sum(dim=(1, 2)).mean()
-        n_neg = total_active - n_pos
+        # 2. Compute dynamic class weights PER-SAMPLE (keep batch dim as B, 1, 1)
+        # sum over spatial dimensions (1, 2) but preserve the batch dimension
+        n_pos = (Y * valid_mask).sum(dim=(1, 2), keepdim=True)  # (B, 1, 1)
+        total_active = valid_mask.sum(dim=(1, 2), keepdim=True) # (B, 1, 1)
+        n_neg = total_active - n_pos                            # (B, 1, 1)
+        
         eps = 1e-6
         raw_pos_weight = total_active / (2.0 * n_pos + eps)
         raw_neg_weight = total_active / (2.0 * n_neg + eps)
+        
+        # Clamp to prevent extreme gradient updates on highly imbalanced samples
         dynamic_pos_weight = torch.clamp(raw_pos_weight, min=0.1, max=25.0)
         dynamic_neg_weight = torch.clamp(raw_neg_weight, min=0.1, max=25.0)
+        
+        # Construct the weight matrix
         pos_w = torch.where(Y > 0.5, dynamic_pos_weight, dynamic_neg_weight)  # (B, N, N)
+        
+        # Apply weights and mask
         weighted_bce = bce_per_element * pos_w * valid_mask  # (B, N, N)
 
-        loss = (weighted_bce.sum(dim=(1, 2)) / (valid_mask.sum(dim=(1, 2)) + 1e-8)).mean()
+        # 3. Safe per-sample reduction (only average over samples that have active elements)
+        sample_sums = weighted_bce.sum(dim=(1, 2))                     # (B,)
+        sample_counts = valid_mask.sum(dim=(1, 2))                     # (B,)
+        
+        active_samples_mask = sample_counts > 0
+        loss = (sample_sums[active_samples_mask] / sample_counts[active_samples_mask]).mean()
 
-        # Separate pos/neg for logging
+        # 4. Separate raw, unweighted pos/neg BCE for clean logging
         pos_mask = (Y > 0.5) & (valid_mask > 0)
         neg_mask = (Y <= 0.5) & (valid_mask > 0)
-        pos_loss = weighted_bce[pos_mask].mean() if pos_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
-        neg_loss = weighted_bce[neg_mask].mean() if neg_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
+        
+        # Use bce_per_element instead of weighted_bce to get clean, interpretable metrics
+        pos_loss = bce_per_element[pos_mask].mean() if pos_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
+        neg_loss = bce_per_element[neg_mask].mean() if neg_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
 
         return loss, {
             'loss_total': loss.item(),

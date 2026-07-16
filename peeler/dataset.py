@@ -9,10 +9,10 @@ Registered with openpoints DATASETS registry.
 """
 import numpy as np
 import torch
-import math
 from torch.utils.data import Dataset
 
 from openpoints.dataset.build import DATASETS
+from .training.augmentation import AugmentationEngine
 
 
 @DATASETS.register_module()
@@ -58,18 +58,22 @@ class PeelerDataset(Dataset):
         self.all_transforms = all_transforms  # list of (N_i, 16)
         self.scene_transforms = scene_transforms  # list of (N_i, 16) from transforms TBO
         self.max_fragments = max_fragments
-        self.translation_scale = translation_scale
-        self.asset_scale_std = asset_scale_std
-        self.scene_scale = scene_scale
-        self.cluster_translation_scale = cluster_translation_scale
         self.embedding_noise_sigma = embedding_noise_sigma
-        self.translation_noise_sigma = translation_noise_sigma
-        self.scaling_noise_sigma = scaling_noise_sigma
-        self.per_asset_rotation = per_asset_rotation
         self.seed = seed
         self._epoch = 0
 
         self.n_assets = len(self.all_embeddings)
+
+        # Augmentation engine for random soup transforms
+        self._engine = AugmentationEngine(
+            translation_noise_sigma=translation_noise_sigma,
+            scaling_noise_sigma=scaling_noise_sigma,
+            per_asset_rotation=per_asset_rotation,
+            asset_scale_std=asset_scale_std,
+            translation_scale=translation_scale,
+            cluster_translation_scale=cluster_translation_scale,
+            scene_scale=scene_scale,
+        )
 
         # Build fragment count buckets (cap oversized assets into max_fragments bucket)
         self._fragments_by_count = {}
@@ -173,20 +177,6 @@ class PeelerDataset(Dataset):
             idx = 0
         return int(self._bucket_sizes[idx])
 
-    def _uniform_rotation(self, rng):
-        """Generate a uniform random 3x3 rotation matrix using Marsaglia method."""
-        axis = rng.randn(3)
-        axis /= np.linalg.norm(axis)
-        theta = rng.uniform(0, np.pi)
-        c = np.cos(theta)
-        s = np.sin(theta)
-        t = 1 - c
-        return np.array([
-            [t * axis[0] * axis[0] + c, t * axis[0] * axis[1] - s * axis[2], t * axis[0] * axis[2] + s * axis[1]],
-            [t * axis[1] * axis[0] + s * axis[2], t * axis[1] * axis[1] + c, t * axis[1] * axis[2] - s * axis[0]],
-            [t * axis[2] * axis[0] - s * axis[1], t * axis[2] * axis[1] + s * axis[0], t * axis[2] * axis[2] + c],
-        ], dtype=np.float32)
-
     def __getitem__(self, idx):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
@@ -237,102 +227,8 @@ class PeelerDataset(Dataset):
         asset_ids = np.concatenate(asset_ids_list, axis=0)
         orig_indices = np.array(orig_indices_list, dtype=np.int64)
 
-        # Per-fragment translation noise (applied first, before other augmentations)
-        if self.translation_noise_sigma > 0:
-            offset = 0
-            for i in range(len(asset_fragments)):
-                n_fragments = asset_fragments[i]
-                noise = rng.randn(n_fragments, 3).astype(np.float32) * self.translation_noise_sigma
-                soup_trans[offset:offset + n_fragments, 3] += noise[:, 0]
-                soup_trans[offset:offset + n_fragments, 7] += noise[:, 1]
-                soup_trans[offset:offset + n_fragments, 11] += noise[:, 2]
-                offset += n_fragments
-
-        # Per-fragment scaling noise (applied after translation noise)
-        if self.scaling_noise_sigma > 0:
-            offset = 0
-            for i in range(len(asset_fragments)):
-                n_fragments = asset_fragments[i]
-                noise = rng.randn(n_fragments, 9).astype(np.float32) * self.scaling_noise_sigma
-                soup_trans[offset:offset + n_fragments, 0] += noise[:, 0]
-                soup_trans[offset:offset + n_fragments, 1] += noise[:, 1]
-                soup_trans[offset:offset + n_fragments, 2] += noise[:, 2]
-                soup_trans[offset:offset + n_fragments, 4] += noise[:, 3]
-                soup_trans[offset:offset + n_fragments, 5] += noise[:, 4]
-                soup_trans[offset:offset + n_fragments, 6] += noise[:, 5]
-                soup_trans[offset:offset + n_fragments, 8] += noise[:, 6]
-                soup_trans[offset:offset + n_fragments, 9] += noise[:, 7]
-                soup_trans[offset:offset + n_fragments, 10] += noise[:, 8]
-                offset += n_fragments
-
-        # Per-asset random rotation (uniform SO(3) about centroid)
-        if self.per_asset_rotation:
-            offset = 0
-            for i in range(len(asset_fragments)):
-                n_fragments = asset_fragments[i]
-                axis = rng.randn(3)
-                axis /= np.linalg.norm(axis)
-                theta = rng.uniform(0, np.pi)
-                c, s, t = np.cos(theta), np.sin(theta), 1 - np.cos(theta)
-                R = np.array([
-                    [t*axis[0]**2 + c,   t*axis[0]*axis[1] - s*axis[2], t*axis[0]*axis[2] + s*axis[1]],
-                    [t*axis[1]*axis[0] + s*axis[2], t*axis[1]**2 + c,   t*axis[1]*axis[2] - s*axis[0]],
-                    [t*axis[2]*axis[0] - s*axis[1], t*axis[2]*axis[1] + s*axis[0], t*axis[2]**2 + c],
-                ], dtype=np.float32)
-                translations = soup_trans[offset:offset + n_fragments, [3, 7, 11]].astype(np.float64)
-                soup_trans[offset:offset + n_fragments, [3, 7, 11]] = (R @ translations.T).T.astype(np.float32)
-                rot_blocks = soup_trans[offset:offset + n_fragments, :12].reshape(n_fragments, 3, 4)[:, :, :3].astype(np.float64)
-                soup_trans[offset:offset + n_fragments, [0, 1, 2, 4, 5, 6, 8, 9, 10]] = (R @ rot_blocks @ R.T).astype(np.float32).reshape(n_fragments, 9)
-                offset += n_fragments
-
-        # Scale normalized asset offsets by random factor (uniform range per asset)
-        asset_scale_range = self.asset_scale_std
-        if len(asset_scale_range) == 2:
-            offset = 0
-            for i in range(len(asset_fragments)):
-                asset_gid = soup_asset_gids[i]
-                n_fragments = asset_fragments[i]
-                scale = min((rng.standard_exponential() / math.log(6)) - 1, 1)
-                scale = math.pow(10, scale)
-                for idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
-                    soup_trans[offset:offset + n_fragments, idx] *= scale
-                offset += n_fragments
-
-        # Random translation augmentation: per-asset translation in world space
-        translation_scale_range = self.translation_scale
-        offset = 0
-        sigma = rng.lognormal(translation_scale_range[0], translation_scale_range[1])
-        cluster_scale_range = self.cluster_translation_scale
-        max_base = 3 + k // 4
-        cluster_weights = np.array([0.05 + 2 ** -x for x in range(max_base)], dtype=np.float32)
-        cluster_weights /= cluster_weights.sum()
-        num_base = int(rng.choice(max_base, p=cluster_weights)) + 1
-        alpha_cluster_prob = np.exp(rng.uniform(-1.0, 2.0))
-        cluster_probs = rng.dirichlet(np.full(num_base, alpha_cluster_prob))
-        axis_scales_list = rng.dirichlet(np.full(3, 0.5), size = num_base).astype(np.float32)
-        base_axis_scales = rng.dirichlet(np.full(3, 0.5)).astype(np.float32)
-        base_positions = rng.uniform(cluster_scale_range[0], cluster_scale_range[1], size=(num_base, 3)).astype(np.float32) * base_axis_scales
-        R_base = self._uniform_rotation(rng)
-        base_positions = (R_base @ base_positions.T).T
-        intra_rotations = [self._uniform_rotation(rng) for _ in range(num_base)]
-        for i in range(len(asset_fragments)):
-            asset_gid = soup_asset_gids[i]
-            n_fragments = asset_fragments[i]
-            chosen = int(rng.choice(num_base, p=cluster_probs))
-            intra_offset = (rng.randn(3) * axis_scales_list[chosen]).astype(np.float32) * sigma
-            intra_offset = intra_rotations[chosen] @ intra_offset
-            t = base_positions[chosen] + intra_offset
-            soup_trans[offset:offset + n_fragments, 3] += t[0]
-            soup_trans[offset:offset + n_fragments, 7] += t[1]
-            soup_trans[offset:offset + n_fragments, 11] += t[2]
-            offset += n_fragments
-
-        # Random scene scaling (uniform factor for entire soup)
-        scene_scale_range = self.scene_scale
-        scene_factor = rng.uniform(scene_scale_range[0], scene_scale_range[1])
-        scene_factor = math.pow(10, scene_factor)
-        for idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]:
-            soup_trans[:, idx] *= scene_factor
+        # Apply random augmentation to transforms
+        self._engine.apply_full_random(soup_trans, asset_fragments, soup_asset_gids, rng, k, self.scene_transforms)
 
         # Shuffle soup
         shuffle_idx = rng.permutation(len(soup_emb))

@@ -197,23 +197,20 @@ def setup(
     optimizer_cfg = cfg.optimizer
     weight_decay = optimizer_cfg.get('weight_decay', 0.01)
 
-    no_decay_weight_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
-
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Do not apply weight decay to biases:
+        if ".bias" in name.lower():
+            no_decay.append(param)
+        else:
+            decay.append(param)
+            
     param_groups = [
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay_weight_decay) and p.requires_grad
-            ],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay_weight_decay) and p.requires_grad
-            ],
-            "weight_decay": 0.0,
-        },
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0}
     ]
 
     if optimizer_cfg.NAME == 'adamw':
