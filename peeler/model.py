@@ -208,12 +208,7 @@ class MLPBlock(nn.Module):
 
     def __init__(self, highway_dim, target_dim):
         super().__init__()
-        self.mlp = nn.Sequential(
-            StableRMSNorm(highway_dim),
-            nn.Linear(highway_dim, target_dim * 2),
-            SwiGLU(),
-            nn.Linear(target_dim, highway_dim)
-        )
+        self.mlp = Symmetrizer(highway_dim, target_dim)
 
     def forward(self, e, mask):
         result = self.mlp(e)
@@ -221,8 +216,40 @@ class MLPBlock(nn.Module):
         result = result * mask_2d
         return e + result
 
+class Symmetrizer(nn.Module):
+    def __init__(self, highway_dim, target_dim):
+        super().__init__()
 
-_PAIRWISE_DIM = 48 * 2
+        self.input_head = nn.Sequential(
+            StableRMSNorm(highway_dim),
+            nn.Linear(highway_dim, target_dim)
+        )
+
+        self.output_head = nn.Sequential(
+            nn.Linear(target_dim * 3, target_dim * 4),
+            SwiGLU(),
+            nn.Linear(target_dim * 2, highway_dim)
+        )
+
+    def forward(self, e):
+        e = self.input_head(e)
+
+        e_T = e.transpose(1, 2)
+
+        h_sum = (e + e_T)                     # Mutual confidence
+        h_diff = torch.abs(e - e_T)         # Conflict/Disagreement
+        h_prod = e * e_T                    # Intersection/Consensus
+        
+        h_sym = torch.cat([h_sum, h_diff, h_prod], dim=-1)  # (B, N, N, 3 * H)
+        
+        
+        logits = self.output_head(h_sym)  # (B, N, N, 1)
+        
+        return logits
+        
+
+
+_PAIRWISE_DIM = 48
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
