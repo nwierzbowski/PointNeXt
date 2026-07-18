@@ -170,32 +170,42 @@ class PurelyRelationalBlock(nn.Module):
         self.norm = StableRMSNorm(highway_dim)
         
         self.left_proj = nn.Sequential(
-            nn.Linear(highway_dim, target_dim * 2),
-            SwiGLU()
+            nn.Linear(highway_dim, target_dim),
+            nn.GELU()
         )
         self.right_proj = nn.Sequential(
-            nn.Linear(highway_dim, target_dim * 2),
-            SwiGLU()
+            nn.Linear(highway_dim, target_dim),
+            nn.GELU()
         )
         self.proj_up = nn.Sequential(
-            # StableRMSNorm(target_dim),
-            nn.Linear(target_dim, highway_dim)
+            nn.Linear(target_dim, highway_dim * 2),
+            SwiGLU(),
+            nn.Linear(highway_dim, highway_dim)
         )
 
     def forward(self, e, mask):
-        B, N, _, D = e.shape
         norm = self.norm(e)
         left = self.left_proj(norm)
         right = self.right_proj(norm)
+
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
         left = left * mask_2d
         right = right * mask_2d
+
         left_perm = left.permute(0, 3, 1, 2)
         right_perm = right.permute(0, 3, 1, 2)
-        triangular_sum = torch.matmul(left_perm, right_perm) / math.sqrt(75)
+
+        num_active = mask.sum(dim=-1, keepdim=True) # (B, 1)
+        scale_factor = torch.sqrt(num_active).unsqueeze(-1).unsqueeze(-1) # (B, 1, 1, 1)
+
+        triangular_sum = torch.matmul(left_perm, right_perm) / scale_factor
         triangular_out = triangular_sum.permute(0, 2, 3, 1)
+
         result = self.proj_up(triangular_out)
         result = result * mask_2d
+
+        # self.res_scale = nn.Parameter(torch.tensor(0.1))
+
         return e + result
 
 
@@ -208,7 +218,13 @@ class MLPBlock(nn.Module):
 
     def __init__(self, highway_dim, target_dim):
         super().__init__()
-        self.mlp = Symmetrizer(highway_dim, target_dim)
+
+        self.mlp = nn.Sequential(
+            StableRMSNorm(highway_dim),
+            nn.Linear(highway_dim, target_dim * 2),
+            SwiGLU(),
+            nn.Linear(target_dim, highway_dim)
+        )
 
     def forward(self, e, mask):
         result = self.mlp(e)
@@ -217,22 +233,13 @@ class MLPBlock(nn.Module):
         return e + result
 
 class Symmetrizer(nn.Module):
-    def __init__(self, highway_dim, target_dim):
+    def __init__(self, input, target):
         super().__init__()
 
-        self.input_head = nn.Sequential(
-            StableRMSNorm(highway_dim),
-            nn.Linear(highway_dim, target_dim)
-        )
-
-        self.output_head = nn.Sequential(
-            nn.Linear(target_dim * 3, target_dim * 4),
-            SwiGLU(),
-            nn.Linear(target_dim * 2, highway_dim)
-        )
+        self.scaler = nn.Linear(input, target)
 
     def forward(self, e):
-        e = self.input_head(e)
+        e = self.scaler(e)
 
         e_T = e.transpose(1, 2)
 
@@ -242,10 +249,7 @@ class Symmetrizer(nn.Module):
         
         h_sym = torch.cat([h_sum, h_diff, h_prod], dim=-1)  # (B, N, N, 3 * H)
         
-        
-        logits = self.output_head(h_sym)  # (B, N, N, 1)
-        
-        return logits
+        return h_sym
         
 
 
@@ -296,11 +300,13 @@ class PurelyRelationalPeeler(nn.Module):
             self.blocks.append(PurelyRelationalBlock(highway_dim, target_dim))
             if self.mlp_sizes[i] > 0:
                 self.blocks.append(MLPBlock(highway_dim, target_dim))
+
         self.output_head = nn.Sequential(
             StableRMSNorm(highway_dim),
-            nn.Linear(highway_dim, 64),
+            Symmetrizer(highway_dim, highway_dim),
+            nn.Linear(highway_dim * 3, highway_dim),
             nn.GELU(),
-            nn.Linear(64, 1)
+            nn.Linear(highway_dim, 1)
         )
 
     def forward(self, embeddings, transforms, mask):

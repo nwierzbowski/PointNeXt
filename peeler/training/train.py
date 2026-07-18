@@ -164,8 +164,8 @@ def _train(
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
                 Y = batch['Y'].to(device, dtype=torch.float32, non_blocking=True)
-                affinity_logits = model(embeddings, transforms, mask)
-                loss, loss_dict = criterion(affinity_logits, Y, mask, epoch, num_epochs)
+                out_embeddings = model(embeddings, transforms, mask)
+                loss, loss_dict = criterion(out_embeddings, Y, mask)
 
             step_loss_accum += loss.item()
 
@@ -232,13 +232,13 @@ def _train(
         val_ari = 0.0
         val_f1 = 0.0
         if val_loader is not None:
-            val_loss, val_ari, val_f1 = validate(
+            val_loss, val_ari, val_f1, ari_thres, f1_thres = validate(
                 model, val_loader, criterion, device, scaler, epoch, num_epochs, threshold=validation_threshold
             )
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
-            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_ari, lr, val_f1)
+            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_ari, lr, val_f1, ari_thres, f1_thres)
 
         # Best model by selected metric
         metric_values = {

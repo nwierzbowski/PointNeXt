@@ -1,6 +1,6 @@
 batch_size: 4
 criterion:
-  NAME: BCEAffinityPeelerLoss
+  NAME: FocalAffinityPeelerLoss
 dataset:
   asset_scale_std:
   - 0.0
@@ -37,14 +37,14 @@ model:
   - 16
   highway_dim: 64
   mlp_sizes:
-  - 176
-  - 176
-  - 176
-  - 176
-  - 176
-  - 176
-  - 176
-  - 176
+  - 128
+  - 128
+  - 128
+  - 128
+  - 128
+  - 128
+  - 128
+  - 128
   pairwise_dropout: 0.0
 optimizer:
   NAME: adamw
