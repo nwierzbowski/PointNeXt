@@ -103,7 +103,8 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     _, N, _ = cand_T.shape
 
     diff = cand_T.unsqueeze(1) - seed_T.unsqueeze(2)  # (B, S, N, 3)
-    dist_raw = torch.norm(diff, dim=-1, keepdim=True)  # (B, S, N, 1)
+    dist_raw = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)
+  # (B, S, N, 1) Dont use norm for numerical stability
     
     seed_S_exp = seed_S.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
     cand_S_exp = cand_S.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
@@ -112,7 +113,7 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     R_seed = seed_rot.reshape(B, S, 3, 3)
     R_cand = cand_rot.reshape(B, N, 3, 3)
 
-    # 2. Unsqueeze and transpose seed rotation for batched matrix multiplication [3, 4]
+    # 2. Unsqueeze and transpose seed rotation for batched matrix multiplication
     R_seed_T = R_seed.unsqueeze(2).transpose(-2, -1)  # (B, S, 1, 3, 3)
     R_cand_exp = R_cand.unsqueeze(1)                  # (B, 1, N, 3, 3)
 
@@ -123,15 +124,11 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     # This features is now 100% rotation-invariant!
     rot_diff = R_rel.reshape(B, S, N, 9)
 
-    # 5. Optimized Cosine Similarity using the Trace [3]
-    # Trace(R_rel) = R_rel[0,0] + R_rel[1,1] + R_rel[2,2]
+    # 5. Optimized Cosine Similarity using the Trace
     trace = R_rel[..., 0, 0] + R_rel[..., 1, 1] + R_rel[..., 2, 2] # (B, S, N)
     rot_cosine = (trace / 3.0).unsqueeze(-1)                      # (B, S, N, 1)
 
     direction_local = torch.matmul(R_seed_T, (diff / (dist_raw.relu() + 1e-8)).unsqueeze(-1)).squeeze(-1) # (B, S, N, 3)
-
-    # print("max: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
-    # print("min: ", torch.log10(torch.clamp(torch.clamp(dist_raw - seed_S_exp - cand_S_exp, min=1e-8), min=1e-8)) / 8 + 1)
 
     return torch.cat([
         direction_local,  # direction (3) - safe division
@@ -255,6 +252,8 @@ class Symmetrizer(nn.Module):
 
 _PAIRWISE_DIM = 48
 
+
+
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
     """Purely relational peeler using triangular edge updates.
@@ -328,32 +327,24 @@ class PurelyRelationalPeeler(nn.Module):
             rot, rot
         )
 
-        # print("rel_feats: ", torch.max(rel_feats), torch.min(rel_feats))
-
-        # norm_embeddings = F.normalize(embeddings, p=2, dim=-1, eps=1e-8)
         norm_embeddings = embeddings / 6
         norm_embeddings = torch.clamp(norm_embeddings, max=2, min=-2)
-        # print("norm_embeddings: ", torch.max(norm_embeddings), torch.min(norm_embeddings))
 
         # Pairwise from embeddings: |e_i - e_j| and e_i * e_j
         emb_i = norm_embeddings.unsqueeze(1)  # (B, 1, N, 256)
         emb_j = norm_embeddings.unsqueeze(2)  # (B, N, 1, 256)
 
         abs_diff = torch.abs(emb_i - emb_j)  # (B, N, N, 256)
-        # print("abs_diff: ", torch.max(abs_diff), torch.min(abs_diff))
 
         prod = emb_i * emb_j  # (B, N, N, 256)
-        # print("prod: ", torch.max(prod), torch.min(prod))
 
         pairwise_feats = torch.cat([abs_diff, emb_i - emb_j], dim=-1)  # (B, N, N, 512)
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
         rel_feats = self.rel_head(rel_feats)
         
         # Concat relative features + pairwise features
-        combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 26)
+        combined = torch.cat([rel_feats, pairwise_feats], dim=-1)  # (B, N, N, 80)
         e = self.input_proj(combined)
-
-        # print("e: ", torch.max(e), torch.min(e))
         
         for block in self.blocks:
             e = block(e, mask)

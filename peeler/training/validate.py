@@ -80,7 +80,7 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs,
     total_loss = 0.0
     batch_count = 0
 
-    thresholds = np.arange(0.1, 0.9, 0.01)
+    thresholds = np.arange(0.0, 1.0, 0.01)
 
     # Initialize tracking structures for each threshold
     ari_sums = {t: 0.0 for t in thresholds}
