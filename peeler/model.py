@@ -85,7 +85,7 @@ def transforms_to_pose(transforms, mask):
 
 
 
-def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot):
+def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot, mask):
     """Compute relative features between seed and candidate poses.
 
     Args:
@@ -103,8 +103,7 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
     _, N, _ = cand_T.shape
 
     diff = cand_T.unsqueeze(1) - seed_T.unsqueeze(2)  # (B, S, N, 3)
-    dist_raw = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8)
-  # (B, S, N, 1) Dont use norm for numerical stability
+    dist_raw = torch.sqrt(torch.sum(diff ** 2, dim=-1, keepdim=True) + 1e-8) # (B, S, N, 1) Dont use norm for numerical stability
     
     seed_S_exp = seed_S.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
     cand_S_exp = cand_S.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
@@ -130,6 +129,30 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
 
     direction_local = torch.matmul(R_seed_T, (diff / (dist_raw.relu() + 1e-8)).unsqueeze(-1)).squeeze(-1) # (B, S, N, 3)
 
+    # NEW FEATURE 1: Neighborhood-Relative Distance with standard log10 dynamic range scaling
+    mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
+    num_active = mask.sum(dim=-1, keepdim=True).unsqueeze(1).unsqueeze(-1)  # (B, 1, 1, 1)
+    num_active_safe = torch.clamp(num_active, min=1.0) # Defensively protect divisor
+    
+    sum_dist = torch.sum(dist_raw * mask_expanded, dim=2, keepdim=True)  # (B, S, 1, 1)
+    mean_dist = sum_dist / num_active_safe  # (B, S, 1, 1)
+    
+    rel_dist_ratio = dist_raw / (mean_dist + 1e-8)
+    rel_dist_to_mean = (torch.log10(rel_dist_ratio + 1e-8) / 8) * mask_expanded  # (B, S, N, 1)
+
+    # NEW FEATURE 2: Physical-Size Relative Distance with standard log10 dynamic range scaling
+    sum_scale = torch.sum(cand_S_exp * mask_expanded, dim=2, keepdim=True)  # (B, 1, 1, 1)
+    mean_scale = sum_scale / num_active_safe  # (B, 1, 1, 1)
+    
+    scale_dist_ratio = dist_raw / (mean_scale + 1e-8)
+    dist_to_mean_scale = (torch.log10(scale_dist_ratio + 1e-8) / 8) * mask_expanded  # (B, S, N, 1)
+
+    # FEATURE 3: Competitive Proximity Attention (Softmax with temperature 0.5)
+    # Masked softmax: set masked-out elements to a very large negative value before softmax
+    # so they evaluate to exactly 0.0 attention score.
+    masked_rel_dist = rel_dist_ratio + (1.0 - mask_expanded) * 1e4
+    proximity_attention = torch.softmax(-masked_rel_dist / 0.5, dim=2)  # (B, S, N, 1)
+
     return torch.cat([
         direction_local,  # direction (3) - safe division
         (torch.log10(((dist_raw - seed_S_exp - cand_S_exp).relu() + 1e-8) / (seed_S_exp + 1e-8)) / 8),  # dist_bwn_normalized_s (1)
@@ -137,9 +160,12 @@ def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot
         (torch.log10(cand_S_exp / (seed_S_exp + 1e-8) + 1e-8) / 8),                             # rel_scale (1)
         rot_diff,                                                               # rot_diff (9)
         rot_cosine,                                                             # rot_cosine (1)
+        rel_dist_to_mean,                                                                # Neighborhood relative distance (1)
+        dist_to_mean_scale,                                                              # Physical-size relative distance (1)
+        proximity_attention
     ], dim=-1)
 
-_REL_FEATURE_DIM = 16
+_REL_FEATURE_DIM = 19
 
 class SwiGLU(nn.Module):
     """
@@ -150,7 +176,68 @@ class SwiGLU(nn.Module):
         # chunk(2, dim=-1) splits the channel dimension into two equal tensors
         x1, x2 = x.chunk(2, dim=-1)
         return x1 * torch.nn.functional.silu(x2)
+    
+class RelationalAttentionBlock(nn.Module):
+    """Competitive Relational Edge Attention Block.
+    
+    Treats the pairwise representation e of shape (B, N, N, D)
+    as N independent sequences of length N, and applies competitive
+    Multi-Head Self-Attention along the columns (rows) to let relations compete.
+    
+    Optimized to utilize PyTorch's native FlashAttention (SDPA) for 
+    maximum GPU memory-efficiency and speed.
+    """
+    def __init__(self, highway_dim, target_dim, num_heads=4):
+        super().__init__()
+        self.norm = StableRMSNorm(highway_dim)
+        self.num_heads = num_heads
+        self.target_dim = target_dim
+        self.head_dim = target_dim // num_heads
+        
+        self.q_proj = nn.Linear(highway_dim, target_dim)
+        self.k_proj = nn.Linear(highway_dim, target_dim)
+        self.v_proj = nn.Linear(highway_dim, target_dim)
+        
+        self.out_proj = nn.Sequential(
+            nn.Linear(target_dim, highway_dim * 2),
+            SwiGLU(),
+            nn.Linear(highway_dim, highway_dim)
+        )
+        
+        # Learnable residual scale to stabilize gradient flow at initialization
+        self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
 
+    def forward(self, e, mask):
+        B, N, _, D = e.shape
+        norm = self.norm(e)  # (B, N, N, D)
+        
+        # Reshape to treat each row as a separate sequence of length N: (B * N, N, D)
+        x = norm.view(B * N, N, D)
+        
+        q = self.q_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B*N, num_heads, N, head_dim)
+        k = self.k_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Construct boolean mask for scaled_dot_product_attention: (B * N, num_heads, N, N)
+        mask_bool = mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
+        mask_bool = mask_bool.expand(B, N, self.num_heads, N, N)
+        mask_bool = mask_bool.reshape(B * N, self.num_heads, N, N).to(torch.bool)
+        
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=mask_bool
+        )  # Output shape: (B * N, num_heads, N, head_dim)
+        
+        # Reshape back to original representation space (B, N, N, target_dim)
+        out = out.transpose(1, 2).reshape(B, N, N, -1)
+        
+        # Project up and add scaled residual
+        result = self.out_proj(out)
+        
+        mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
+        result = result * mask_2d
+        
+        return e + self.res_scale * result
 class PurelyRelationalBlock(nn.Module):
     """Bottleneck Purely Relational Block with fixed highway.
 
@@ -180,6 +267,8 @@ class PurelyRelationalBlock(nn.Module):
             nn.Linear(highway_dim, highway_dim)
         )
 
+        self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
+
     def forward(self, e, mask):
         norm = self.norm(e)
         left = self.left_proj(norm)
@@ -203,7 +292,7 @@ class PurelyRelationalBlock(nn.Module):
 
         # self.res_scale = nn.Parameter(torch.tensor(0.1))
 
-        return e + result
+        return e + self.res_scale * result
 
 
 class MLPBlock(nn.Module):
@@ -223,11 +312,13 @@ class MLPBlock(nn.Module):
             nn.Linear(target_dim, highway_dim)
         )
 
+        self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
+
     def forward(self, e, mask):
         result = self.mlp(e)
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
         result = result * mask_2d
-        return e + result
+        return e + self.res_scale * result
 
 class Symmetrizer(nn.Module):
     def __init__(self, input, target):
@@ -283,20 +374,27 @@ class PurelyRelationalPeeler(nn.Module):
             nn.Linear(256, _PAIRWISE_DIM),
         )
 
+        _HIDDEN_REL = 32
+        _HIDDEN_FEATS = _PAIRWISE_DIM + _HIDDEN_REL
+
         self.rel_head = nn.Sequential(
             nn.Linear(_REL_FEATURE_DIM, 64),
             SwiGLU(),
-            nn.Linear(32, _REL_FEATURE_DIM * 2)
+            nn.Linear(32, _HIDDEN_REL)
         )
         self.input_proj = nn.Sequential(
-            nn.Linear(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM, (_REL_FEATURE_DIM* 2 + _PAIRWISE_DIM) * 2),
+            nn.Linear(_HIDDEN_FEATS, _HIDDEN_FEATS * 2),
             SwiGLU(),
-            StableRMSNorm(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM),
-            nn.Linear(_REL_FEATURE_DIM * 2 + _PAIRWISE_DIM, highway_dim),
+            StableRMSNorm(_HIDDEN_FEATS),
+            nn.Linear(_HIDDEN_FEATS, highway_dim),
         )
         self.blocks = nn.ModuleList()
         for i, target_dim in enumerate(self.downsample_schedule):
-            self.blocks.append(PurelyRelationalBlock(highway_dim, target_dim))
+            if i % 2 == 0:
+                self.blocks.append(RelationalAttentionBlock(highway_dim, target_dim))
+            else:
+                self.blocks.append(PurelyRelationalBlock(highway_dim, target_dim))
+
             if self.mlp_sizes[i] > 0:
                 self.blocks.append(MLPBlock(highway_dim, target_dim))
 
@@ -324,7 +422,7 @@ class PurelyRelationalPeeler(nn.Module):
         rel_feats = compute_relative_features(
             translation, scale.squeeze(-1),
             translation, scale.squeeze(-1),
-            rot, rot
+            rot, rot, mask
         )
 
         norm_embeddings = embeddings / 6

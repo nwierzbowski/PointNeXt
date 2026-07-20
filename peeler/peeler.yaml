@@ -4,7 +4,7 @@ criterion:
 dataset:
   asset_scale_std:
   - 0.0
-  - 0.01
+  - 0.0
   cluster_translation_scale:
   - -30.0
   - 30.0
@@ -18,7 +18,7 @@ dataset:
   translation_noise_sigma: 0.0
   translation_scale:
   - 0.0
-  - 0.002
+  - 0.0
 embedding_noise_sigma: 0.0
 epochs: 20
 grad_accum_steps: 8
@@ -29,22 +29,10 @@ model:
   downsample_schedule:
   - 16
   - 16
-  - 16
-  - 16
-  - 16
-  - 16
-  - 16
-  - 16
-  highway_dim: 64
+  highway_dim: 16
   mlp_sizes:
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
-  - 128
+  - 64
+  - 64
   pairwise_dropout: 0.0
 optimizer:
   NAME: adamw

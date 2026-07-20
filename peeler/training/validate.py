@@ -98,7 +98,7 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs,
             Y = batch['Y'].to(device).float()
 
             asset_ids = batch.get('asset_ids')
-            asset_ids_np = asset_ids.cpu().numpy() if asset_ids is not None else None
+            asset_ids_np = asset_ids.cpu().numpy()
 
             # Forward pass within autocast
             with torch.amp.autocast(device_type=device_type):
@@ -127,8 +127,6 @@ def validate(model, val_loader, criterion, device, scaler, epoch, num_epochs,
             B = soft_A.shape[0]
             for b in range(B):
                 active_indices = np.where(mask_np[b] > 0.5)[0]
-                if len(active_indices) < 2:
-                    continue
 
                 b_affinities = soft_A[b][active_indices][:, active_indices]
 
