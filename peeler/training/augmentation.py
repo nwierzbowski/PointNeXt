@@ -33,6 +33,7 @@ class AugmentationEngine:
         translation_scale = (0.0, 0.5),
         cluster_translation_scale = (1.0, 5.0),
         scene_scale = (-1.0, 1.0),
+        embedding_noise_sigma: float = 0.0,
     ):
         self.translation_noise_sigma = translation_noise_sigma
         self.scaling_noise_sigma = scaling_noise_sigma
@@ -41,40 +42,36 @@ class AugmentationEngine:
         self.translation_scale = translation_scale
         self.cluster_translation_scale = cluster_translation_scale
         self.scene_scale = scene_scale
+        self.embedding_noise_sigma = embedding_noise_sigma
 
-    def apply_full_random(self, soup_trans, asset_fragments, soup_asset_gids, rng, k, scene_transforms):
+    def apply_full_random(self, soup_trans, soup_emb, asset_fragments, soup_asset_gids, rng, k,
+                          ordered_transforms, is_duplicate):
         """Apply the full random augmentation pipeline in-place.
 
         Args:
             soup_trans: (N, 16) transform array, modified in-place
+            soup_emb: (N, 256) embedding array, modified in-place
             asset_fragments: list of fragment counts per asset in soup
             soup_asset_gids: list of asset global IDs
             rng: numpy RandomState instance
             k: number of assets in the soup
-            scene_transforms: list of numpy arrays, one per scene (from transforms TBO), each (M_i, 16) 4x4 matrices
+            ordered_transforms: list of K numpy arrays, each (4, 4) matrix in position order
+            is_duplicate: list of K booleans, True if position is a duplicate (not first occurrence of its cluster)
         """
-        self._apply_translation_noise(soup_trans, asset_fragments, rng)
-        self._apply_scaling_noise(soup_trans, asset_fragments, rng)
-        
-        # 0-------------1
-        # synth-----scene
-        synth_prob = 0
-        
-        # 50/50 choice between scene transforms and cluster translation
-        if rng.random() > synth_prob:
-            self.apply_scene_transforms(soup_trans, asset_fragments, soup_asset_gids, rng, k, scene_transforms)
-        else:
-            if self.per_asset_rotation:
-                self._apply_per_asset_rotation(soup_trans, asset_fragments, rng)
-            self._apply_per_asset_scaling(soup_trans, asset_fragments, rng)
-            self._apply_cluster_translation(soup_trans, asset_fragments, soup_asset_gids, rng, k)
+        self._apply_translation_noise(soup_trans, asset_fragments, rng, is_duplicate)
+        self._apply_scaling_noise(soup_trans, asset_fragments, rng, is_duplicate)
+        self._apply_embedding_noise(soup_emb, asset_fragments, rng, is_duplicate)
 
-    def apply_scene_transforms(self, soup_trans, asset_fragments, soup_asset_gids, rng, k, scene_transforms):
+        self._apply_per_asset_rotation_noise(soup_trans, asset_fragments, rng)
+        self.apply_scene_transforms(soup_trans, asset_fragments, soup_asset_gids, rng, k, ordered_transforms)
+        
+
+    def apply_scene_transforms(self, soup_trans, asset_fragments, soup_asset_gids, rng, k, ordered_transforms):
         """Apply real scene transforms to soup assets in-place.
 
-        Picks one random scene from the transforms TBO and applies its transforms
-        sequentially to soup assets (1 per asset). When the scene runs out,
-        picks a new random scene and continues.
+        Uses the pre-selected ordered transforms (one per soup asset position)
+        and applies them sequentially. Per-asset scale and translation noise
+        is added on top.
 
         Args:
             soup_trans: (N, 16) transform array, modified in-place
@@ -82,29 +79,17 @@ class AugmentationEngine:
             soup_asset_gids: list of asset global IDs
             rng: numpy RandomState instance
             k: number of assets in the soup
-            scene_transforms: list of numpy arrays, one per scene (from transforms TBO), each (M_i, 16) 4x4 matrices
+            ordered_transforms: list of K numpy arrays, each (4, 4) matrix in position order
         """
         num_assets = len(asset_fragments)
         scales = rng.randn(num_assets) * self.asset_scale_std[1] + 1
-        translations = (rng.randn(num_assets, 3) * self.translation_scale[1] + 1).astype(np.float32)
+        translations = (rng.randn(num_assets, 3) * self.translation_scale[1]).astype(np.float32)
 
         offset = 0
-        scene_idx = rng.randint(len(scene_transforms))
-        transforms = scene_transforms[scene_idx]
-        perm = rng.permutation(len(transforms))
-        t_idx = 0
 
         for i in range(num_assets):
             n = asset_fragments[i]
-
-            # When current scene runs out, pick a new random scene
-            if t_idx >= len(transforms):
-                scene_idx = rng.randint(len(scene_transforms))
-                transforms = scene_transforms[scene_idx]
-                perm = rng.permutation(len(transforms))
-                t_idx = 0
-
-            matrix = transforms[perm[t_idx]].reshape(4, 4).astype(np.float64)
+            matrix = ordered_transforms[i].reshape(4, 4).astype(np.float64)
             R = matrix[:3, :3]
             t = matrix[:3, 3]
 
@@ -114,19 +99,21 @@ class AugmentationEngine:
 
             # Apply rotation to translation, then add scene translation and per-asset translation offset
             asset_translations = soup_trans[offset:offset + n, [3, 7, 11]].astype(np.float64)
-            soup_trans[offset:offset + n, [3, 7, 11]] = (asset_translations @ R.T + t * translations[i]).astype(np.float32)
+            soup_trans[offset:offset + n, [3, 7, 11]] = (asset_translations @ R.T * scales[i] + t + translations[i]).astype(np.float32)
 
-            t_idx += 1
             offset += n
 
     # ------------------------------------------------------------------
     # Individual augmentation steps
     # ------------------------------------------------------------------
 
-    def _apply_translation_noise(self, soup_trans, asset_fragments, rng):
+    def _apply_translation_noise(self, soup_trans, asset_fragments, rng, is_duplicate):
         if self.translation_noise_sigma > 0:
             offset = 0
             for i in range(len(asset_fragments)):
+                if not is_duplicate[i]:
+                    offset += asset_fragments[i]
+                    continue
                 n = asset_fragments[i]
                 noise = rng.randn(n, 3).astype(np.float32) * self.translation_noise_sigma
                 soup_trans[offset:offset + n, 3] += noise[:, 0]
@@ -134,16 +121,70 @@ class AugmentationEngine:
                 soup_trans[offset:offset + n, 11] += noise[:, 2]
                 offset += n
 
-    def _apply_scaling_noise(self, soup_trans, asset_fragments, rng):
+    def _apply_scaling_noise(self, soup_trans, asset_fragments, rng, is_duplicate):
         if self.scaling_noise_sigma > 0:
             offset = 0
             for i in range(len(asset_fragments)):
+                if not is_duplicate[i]:
+                    offset += asset_fragments[i]
+                    continue
                 n = asset_fragments[i]
                 # Generate a SINGLE isotropic scale factor per fragment
                 noise = rng.randn(n, 1).astype(np.float32) * self.scaling_noise_sigma + 1.0
                 
                 # Multiply all 9 components of the 3x3 matrix by the same scalar
                 soup_trans[offset:offset + n, [0, 1, 2, 4, 5, 6, 8, 9, 10]] *= noise
+                offset += n
+
+    def _apply_embedding_noise(self, soup_emb, asset_fragments, rng, is_duplicate):
+        # Embedding noise — only on duplicate positions
+        if self.embedding_noise_sigma > 0:
+            is_dup_frag = np.repeat(is_duplicate, asset_fragments)
+            noise = rng.randn(*soup_emb.shape).astype(np.float32) * self.embedding_noise_sigma
+            noise[~is_dup_frag] = 0
+            soup_emb += noise
+
+    def _apply_per_asset_rotation_noise(self, soup_trans, asset_fragments, rng):
+        """Applies a small, random rigid 3D rotation noise per asset.
+
+        Rotates the entire asset (all of its fragments rigidly) by a single
+        random rotation matrix. This requires rotating both the 3x3 orientation
+        blocks and the local translation vectors of all fragments in the asset.
+        """
+        rotation_noise_sigma = 0.0
+
+        if rotation_noise_sigma > 0:
+            offset = 0
+            for i in range(len(asset_fragments)):
+                n = asset_fragments[i]
+                
+                # 1. Generate a SINGLE random 3D rotation matrix for the entire asset i
+                tx, ty, tz = rng.normal(scale=rotation_noise_sigma, size=3)
+                R_approx = np.array([
+                    [1.0, -tz,  ty],
+                    [ tz, 1.0, -tx],
+                    [-ty,  tx, 1.0]
+                ], dtype=np.float64)
+                
+                # Extract perfectly orthogonal Q matrix via QR decomposition 
+                # to prevent any geometric shearing or scale drift
+                Q, _ = np.linalg.qr(R_approx) # (3, 3) rotation matrix
+                
+                # 2. Apply Q rigidly to all n fragments of asset i
+                for j in range(n):
+                    idx = offset + j
+                    
+                    # Rotate the 3x3 orientation block: R_new = Q @ R_orig
+                    R_orig = soup_trans[idx, [0, 1, 2, 4, 5, 6, 8, 9, 10]].reshape(3, 3).astype(np.float64)
+                    R_new = Q @ R_orig
+                    soup_trans[idx, [0, 1, 2, 4, 5, 6, 8, 9, 10]] = R_new.astype(np.float32).flatten()
+                    
+                    # Rotate the local translation vector: t_new = t_orig @ Q.T
+                    # This correctly orbits the fragment centers around the asset center.
+                    t_orig = soup_trans[idx, [3, 7, 11]].reshape(1, 3).astype(np.float64)
+                    t_new = t_orig @ Q.T
+                    soup_trans[idx, [3, 7, 11]] = t_new.astype(np.float32).flatten()
+                    
                 offset += n
 
     def _apply_per_asset_rotation(self, soup_trans, asset_fragments, rng):

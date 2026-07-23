@@ -49,6 +49,7 @@ class PeelerDataset(Dataset):
         scene_scale,
         cluster_translation_scale,
         scene_transforms,
+        scene_similarities,
         embedding_noise_sigma=0.0,
         translation_noise_sigma=0.0,
         scaling_noise_sigma=0.0,
@@ -57,6 +58,7 @@ class PeelerDataset(Dataset):
         self.all_embeddings = all_embeddings  # list of (N_i, 256)
         self.all_transforms = all_transforms  # list of (N_i, 16)
         self.scene_transforms = scene_transforms  # list of (N_i, 16) from transforms TBO
+        self.scene_similarities = scene_similarities  # list of (N_i, M_i) cluster indices from transforms TBO
         self.max_fragments = max_fragments
         self.embedding_noise_sigma = embedding_noise_sigma
         self.seed = seed
@@ -83,6 +85,12 @@ class PeelerDataset(Dataset):
             self._fragments_by_count.setdefault(effective_n, []).append(i)
 
         self._bucket_sizes = np.array(sorted(self._fragments_by_count.keys()), dtype=np.int32)
+
+        # Build scene count buckets
+        self._scene_buckets = {}
+        for scene_idx, transforms in enumerate(self.scene_transforms):
+            self._scene_buckets.setdefault(len(transforms), []).append(scene_idx)
+        self._scene_bucket_sizes = np.array(sorted(self._scene_buckets.keys()), dtype=np.int32)
 
     def set_epoch(self, epoch: int):
         """Set the epoch for randomization."""
@@ -177,69 +185,132 @@ class PeelerDataset(Dataset):
             idx = 0
         return int(self._bucket_sizes[idx])
 
+    def _pick_scenes_for_k(self, k, rng):
+        """Pick scenes whose total capacity >= k, using a random eligible bucket."""
+        idx = np.searchsorted(self._scene_bucket_sizes, k, side='left')
+        if idx >= len(self._scene_bucket_sizes):
+            idx = len(self._scene_bucket_sizes) - 1
+
+        eligible_sizes = self._scene_bucket_sizes[idx:]
+        bucket_size = int(rng.choice(eligible_sizes))
+        bucket_scenes = self._scene_buckets[bucket_size]
+
+        scenes = []
+        remaining = k
+        while remaining > 0:
+            scene_idx = int(rng.choice(bucket_scenes))
+            perm = rng.permutation(bucket_size)
+            take = min(remaining, bucket_size)
+            scenes.append((scene_idx, perm, take))
+            remaining -= take
+        return scenes
+
     def __getitem__(self, idx):
         # Create fresh RNG seeded by epoch + idx for full randomization
         rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
 
-        # N = int(rng.randint(2, self.max_fragments + 1))
+        # Phase 1: Generate soup partition (fragment allocation across K assets)
         N = self.max_fragments
         sizes, k, alpha_cluster_prob, mu, u = self._sample_soup_partition(rng, N)
 
+        # Phase 2: Pre-select scenes based on K, then group by (scene_idx, cluster_idx)
+        selected_scenes = self._pick_scenes_for_k(k, rng)
+        scene_cursor = 0
+        scene_pos_in_perm = 0
+        cluster_map = {}  # (scene_idx, cluster_idx) -> list of position indices
+        position_clusters = [None] * k
+        ordered_transforms_for_soup = []  # list of (4,4) matrices in position order
+
+        for i in range(k):
+            scene_idx, perm, take = selected_scenes[scene_cursor]
+            t_in_scene = perm[scene_pos_in_perm]
+            cluster_idx = int(self.scene_similarities[scene_idx][t_in_scene])
+            cluster_key = (scene_idx, cluster_idx)
+            position_clusters[i] = cluster_key
+            cluster_map.setdefault(cluster_key, []).append(i)
+            ordered_transforms_for_soup.append(self.scene_transforms[scene_idx][t_in_scene].reshape(4, 4))
+            scene_pos_in_perm += 1
+            if scene_pos_in_perm >= take:
+                scene_cursor += 1
+                scene_pos_in_perm = 0
+
+        # Phase 3: Track duplicate positions and adjust allocations
+        is_duplicate = [False] * k
+        for cluster_key, positions in cluster_map.items():
+            for pos in positions[1:]:  # skip first occurrence
+                is_duplicate[pos] = True
+
+        allocations = [float(s) for s in sizes]
+        for cluster_key, positions in cluster_map.items():
+            if len(positions) > 1:
+                total_alloc = sum(allocations[p] for p in positions)
+                new_alloc = total_alloc / len(positions)
+                for p in positions:
+                    allocations[p] = new_alloc
+
+        # Phase 4: Pick assets (one per cluster group, reused for all positions in group)
+        cluster_to_data = {}  # (scene_idx, cluster_idx) -> (asset_gid, emb, trans, chosen_idx)
         soup_emb_list = []
         soup_trans_list = []
         asset_ids_list = []
         orig_indices_list = []
-        total_fragments = 0
         asset_fragments = []
         soup_asset_gids = []
 
-        for s in sizes:
-            bucket_size = self._find_bucket_at_or_below(s)
-            bucket_pool = self._fragments_by_count[bucket_size]
-            asset_gid = int(rng.choice(bucket_pool))
+        for i in range(k):
+            cluster_key = position_clusters[i]
+            alloc = int(round(allocations[i]))
 
-            emb = self.all_embeddings[asset_gid]
-            trans = self.all_transforms[asset_gid]
-            n_available = len(emb)
+            if cluster_key not in cluster_to_data:
+                bucket_size = self._find_bucket_at_or_below(alloc)
+                bucket_pool = self._fragments_by_count[bucket_size]
+                asset_gid = int(rng.choice(bucket_pool))
 
-            # Sample bucket_size fragments from the asset (handles oversized assets)
-            if n_available > bucket_size:
-                chosen_idx = rng.choice(n_available, bucket_size, replace=False)
-                chosen_idx.sort()
-                emb = emb[chosen_idx]
-                trans = trans[chosen_idx]
-                local_indices = chosen_idx
-            else:
-                local_indices = np.arange(n_available)
+                emb = self.all_embeddings[asset_gid]
+                trans = self.all_transforms[asset_gid]
+                n_available = len(emb)
 
+                if n_available > alloc:
+                    chosen_idx = rng.choice(n_available, alloc, replace=False)
+                    chosen_idx.sort()
+                    emb = emb[chosen_idx]
+                    trans = trans[chosen_idx]
+                else:
+                    chosen_idx = np.arange(n_available)
+
+                cluster_to_data[cluster_key] = (asset_gid, emb, trans, chosen_idx)
+
+            asset_gid, emb, trans, chosen_idx = cluster_to_data[cluster_key]
             n_fragments = len(emb)
 
             soup_emb_list.append(emb)
             soup_trans_list.append(trans)
-            asset_ids_list.append(np.full(n_fragments, len(asset_ids_list), dtype=np.int64))
-            orig_indices_list.extend(local_indices + asset_gid * 1_000_000_000)
+            asset_ids_list.append(np.full(n_fragments, i, dtype=np.int64))
+            orig_indices_list.extend(chosen_idx + asset_gid * 1_000_000_000)
 
-            total_fragments += n_fragments
             asset_fragments.append(n_fragments)
             soup_asset_gids.append(asset_gid)
+
         soup_emb = np.concatenate(soup_emb_list, axis=0)
         soup_trans = np.concatenate(soup_trans_list, axis=0)
         asset_ids = np.concatenate(asset_ids_list, axis=0)
         orig_indices = np.array(orig_indices_list, dtype=np.int64)
 
-        # Apply random augmentation to transforms
-        self._engine.apply_full_random(soup_trans, asset_fragments, soup_asset_gids, rng, k, self.scene_transforms)
+        # Phase 5: Apply augmentation with ordered scene transforms (all noise types)
+        self._engine.apply_full_random(
+            soup_trans, soup_emb, asset_fragments, soup_asset_gids, rng, k,
+            ordered_transforms_for_soup, is_duplicate,
+        )
 
         # Shuffle soup
         shuffle_idx = rng.permutation(len(soup_emb))
         soup_emb = soup_emb[shuffle_idx]
-        if self.embedding_noise_sigma > 0:
-            soup_emb = soup_emb + np.random.default_rng(self.seed + self._epoch).normal(scale=self.embedding_noise_sigma, size=soup_emb.shape).astype(soup_emb.dtype)
         soup_trans = soup_trans[shuffle_idx]
         asset_ids = asset_ids[shuffle_idx]
         orig_indices = orig_indices[shuffle_idx]
 
         # Build N x N ground truth: Y_ij = 1 if same asset (bool, 1/4 memory of float32)
+        # Each position gets a unique asset_id — model must learn to split duplicates
         Y = (asset_ids[:, None] == asset_ids[None, :])
 
         actual_n = len(soup_emb)

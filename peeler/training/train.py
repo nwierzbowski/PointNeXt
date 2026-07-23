@@ -45,7 +45,7 @@ def peeler_train(
         checkpoint_dir: Directory for checkpoint files
         start_epoch: Epoch to resume from (0 = fresh start)
         log_callback: Called with (message: str)
-        epoch_callback: Called with (epoch, total, loss, val_loss, val_ari, lr, val_f1)
+        epoch_callback: Called with (log_message: str)
         step_callback: Called with (step, epoch, loss)
         stop_callback: Called with no args, returns True to stop training
 
@@ -72,12 +72,11 @@ def peeler_train(
     num_epochs = cfg['epochs']
     device = device or cfg['training']['device']
     report_interval = cfg['training']['report_interval']
-    ema_alpha = cfg['training']['ema_alpha']
     best_metric = 'ari'
-    validation_threshold = cfg.get('validation', {}).get('threshold', 0.5)
 
     # 4. Internal train() — called with all config loaded
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
+    max_batches = cfg.get('validation', {}).get('max_batches')
 
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
@@ -87,10 +86,9 @@ def peeler_train(
         scaler=scaler,
         start_epoch=start_epoch,
         report_interval=report_interval,
-        ema_alpha=ema_alpha,
         best_metric=best_metric,
-        validation_threshold=validation_threshold,
         grad_accum_steps=grad_accum_steps,
+        max_batches=max_batches,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -128,16 +126,16 @@ def _train(
     scaler=None,
     step_callback=None,
     report_interval=10,
-    ema_alpha=0.1,
     best_metric='ari',
-    validation_threshold=0.5,
     grad_accum_steps=1,
+    max_batches=None,
 ):
     """Run the training epoch loop."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
     best_epoch = 0
     global_step = 0
-    ema_loss = None
+    report_loss = 0.0
+    graph_loss = 0.0
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         train_loader.dataset.set_epoch(epoch)
@@ -148,6 +146,7 @@ def _train(
         num_batches = 0
         stopped = False
         use_amp = scaler is not None
+        
 
         step_loss_accum = 0.0
         for batch_idx, batch in enumerate(train_loader):
@@ -197,24 +196,28 @@ def _train(
                 batch_loss = step_loss_accum / actual_accum
 
                 total_loss += batch_loss
+                report_loss += batch_loss
+                graph_loss += batch_loss
                 num_batches += 1
 
-                if step_callback and global_step % report_interval == 0:
-                    if ema_loss is None:
-                        ema_loss = batch_loss
-                    else:
-                        ema_loss = ema_alpha * batch_loss + (1 - ema_alpha) * ema_loss
-                    step_callback(global_step, epoch, ema_loss)
+                graph_interval = 5
+                if step_callback and global_step % graph_interval == 0:
+                    step_callback(global_step, epoch, graph_loss / graph_interval)
+                    graph_loss = 0
 
-                    if log_callback:
-                        elapsed = time.time() - epoch_start_time
-                        iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
-                        lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
-                        log_callback(
-                            f'Step {global_step} (epoch {epoch}) - '
-                            f'Loss: {ema_loss:.4f} | LR: {lr:.6f} | '
-                            f'{iters_per_sec:.1f} it/s'
-                        )
+                if log_callback and global_step % report_interval == 0:
+
+                    elapsed = time.time() - epoch_start_time
+                    iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
+                    lr = scheduler.optimizer.param_groups[0]['lr'] if hasattr(scheduler, 'optimizer') else optimizer.param_groups[0]['lr']
+                    log_callback(
+                        f'Step {global_step} (epoch {epoch}) - '
+                        f'Loss: {report_loss / report_interval:.4f} | LR: {lr:.6f} | '
+                        f'{iters_per_sec:.1f} it/s'
+                    )
+                    report_loss = 0
+                
+                
 
             if stop_callback and stop_callback():
                 if log_callback:
@@ -228,17 +231,25 @@ def _train(
         avg_loss = total_loss / max(num_batches, 1)
 
         # Validation every epoch
-        val_loss = avg_loss
+        val_loss = -1
         val_ari = 0.0
         val_f1 = 0.0
+        val_ari_thres = 0.0
+        val_f1_thres = 0.0
         if val_loader is not None:
-            val_loss, val_ari, val_f1, ari_thres, f1_thres = validate(
-                model, val_loader, criterion, device, scaler, epoch, num_epochs, threshold=validation_threshold
+            val_loss, val_ari, val_f1, val_ari_thres, val_f1_thres = validate(
+                model, val_loader, criterion, device
             )
+
+        # Training set validation
+        train_loss, train_ari, train_f1, train_ari_thres, train_f1_thres = validate(
+            model, train_loader, criterion, device, max_batches=max_batches
+        )
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
-            epoch_callback(epoch, num_epochs, avg_loss, val_loss, val_ari, lr, val_f1, ari_thres, f1_thres)
+            log_msg = f'Epoch {epoch}/{num_epochs} - Loss {avg_loss:.4f} | Trn: Loss: {train_loss:.4f} ARI: {train_ari:.4f} F1: {train_f1:.4f} ARI Thresh: {train_ari_thres:.2f} F1 Thresh: {train_f1_thres:.2f} | Val: Loss: {val_loss:.4f}  ARI: {val_ari:.4f} F1: {val_f1:.4f} ARI Thresh: {val_ari_thres:.2f} F1 Thresh: {val_f1_thres:.2f} | LR: {lr:.2e}'
+            epoch_callback(log_msg)
 
         # Best model by selected metric
         metric_values = {

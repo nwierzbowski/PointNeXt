@@ -54,7 +54,7 @@ def train(
         log_callback: callable(str) for progress logging
         start_epoch: epoch to start from (0 = fresh training)
         stop_callback: callable() -> bool, returns True if training should stop
-        epoch_callback: callable(epoch, total_epochs, loss) for epoch progress
+        epoch_callback: callable(log_message: str) for epoch progress
         scaler: GradScaler for AMP (None = no AMP)
         step_callback: callable(step, epoch, loss) for step progress
         report_interval: report loss every N batches
@@ -95,7 +95,8 @@ def train(
             break
 
         if epoch_callback:
-            epoch_callback(epoch, num_epochs, avg_loss)
+            log_msg = f'Epoch {epoch}/{num_epochs} - Loss: {avg_loss:.4f}'
+            epoch_callback(log_msg)
         if reconstruction_callback and last_batch is not None:
             data = {k: v.to(device, non_blocking=True) for k, v in last_batch.items() if k != 'uuids'}
             uuid = last_batch['uuids'][0] if isinstance(last_batch['uuids'], (list, tuple)) else last_batch['uuids'].item()

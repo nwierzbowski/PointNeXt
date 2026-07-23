@@ -178,21 +178,14 @@ class SwiGLU(nn.Module):
         return x1 * torch.nn.functional.silu(x2)
     
 class RelationalAttentionBlock(nn.Module):
-    """Competitive Relational Edge Attention Block.
-    
-    Treats the pairwise representation e of shape (B, N, N, D)
-    as N independent sequences of length N, and applies competitive
-    Multi-Head Self-Attention along the columns (rows) to let relations compete.
-    
-    Optimized to utilize PyTorch's native FlashAttention (SDPA) for 
-    maximum GPU memory-efficiency and speed.
-    """
-    def __init__(self, highway_dim, target_dim, num_heads=4):
+    """Competitive Relational Edge Attention Block."""
+    def __init__(self, highway_dim, target_dim, num_heads=4, attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
         self.norm = StableRMSNorm(highway_dim)
         self.num_heads = num_heads
         self.target_dim = target_dim
         self.head_dim = target_dim // num_heads
+        self.attn_dropout = attn_dropout
         
         self.q_proj = nn.Linear(highway_dim, target_dim)
         self.k_proj = nn.Linear(highway_dim, target_dim)
@@ -204,53 +197,46 @@ class RelationalAttentionBlock(nn.Module):
             nn.Linear(highway_dim, highway_dim)
         )
         
-        # Learnable residual scale to stabilize gradient flow at initialization
+        # PROJECTION DROPOUT (Applied to the branch output)
+        self.proj_dropout = nn.Dropout(proj_dropout)
         self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
 
     def forward(self, e, mask):
         B, N, _, D = e.shape
         norm = self.norm(e)  # (B, N, N, D)
         
-        # Reshape to treat each row as a separate sequence of length N: (B * N, N, D)
         x = norm.view(B * N, N, D)
         
-        q = self.q_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B*N, num_heads, N, head_dim)
+        q = self.q_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B * N, N, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Construct boolean mask for scaled_dot_product_attention: (B * N, num_heads, N, N)
-        mask_bool = mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
+        mask_bool = mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)
         mask_bool = mask_bool.expand(B, N, self.num_heads, N, N)
         mask_bool = mask_bool.reshape(B * N, self.num_heads, N, N).to(torch.bool)
         
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=mask_bool
-        )  # Output shape: (B * N, num_heads, N, head_dim)
+            q, k, v,
+            attn_mask=mask_bool,
+            dropout_p=self.attn_dropout if self.training else 0.0
+        )
         
-        # Reshape back to original representation space (B, N, N, target_dim)
         out = out.transpose(1, 2).reshape(B, N, N, -1)
         
-        # Project up and add scaled residual
+        # Project up, apply dropout to the branch update
         result = self.out_proj(out)
+        result = self.proj_dropout(result)  # <--- Drop out here
         
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
         result = result * mask_2d
         
+        # The highway "e" remains untouched by dropout
         return e + self.res_scale * result
+    
 class PurelyRelationalBlock(nn.Module):
-    """Bottleneck Purely Relational Block with fixed highway.
-
-    Projects input down to target dim, runs relational update,
-    projects back up, then adds result to the residual highway.
-
-    highway_dim: fixed width of the residual connection
-    target_dim: reduced dimension for the matmul computation
-    """
-
-    def __init__(self, highway_dim, target_dim):
+    """Bottleneck Purely Relational Block with fixed highway."""
+    def __init__(self, highway_dim, target_dim, dropout=0.0):
         super().__init__()
-
         self.norm = StableRMSNorm(highway_dim)
         
         self.left_proj = nn.Sequential(
@@ -268,6 +254,7 @@ class PurelyRelationalBlock(nn.Module):
         )
 
         self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
+        self.dropout = nn.Dropout(dropout)  # Regulates the final branch output
 
     def forward(self, e, mask):
         norm = self.norm(e)
@@ -281,41 +268,37 @@ class PurelyRelationalBlock(nn.Module):
         left_perm = left.permute(0, 3, 1, 2)
         right_perm = right.permute(0, 3, 1, 2)
 
-        num_active = mask.sum(dim=-1, keepdim=True) # (B, 1)
-        scale_factor = torch.sqrt(num_active).unsqueeze(-1).unsqueeze(-1) # (B, 1, 1, 1)
+        num_active = mask.sum(dim=-1, keepdim=True)
+        scale_factor = torch.sqrt(num_active).unsqueeze(-1).unsqueeze(-1)
 
         triangular_sum = torch.matmul(left_perm, right_perm) / scale_factor
         triangular_out = triangular_sum.permute(0, 2, 3, 1)
 
+        # Project up, then apply dropout to the branch update
         result = self.proj_up(triangular_out)
+        result = self.dropout(result)  # <--- Drop out here
         result = result * mask_2d
-
-        # self.res_scale = nn.Parameter(torch.tensor(0.1))
 
         return e + self.res_scale * result
 
 
 class MLPBlock(nn.Module):
-    """MLP residual block on pairwise feature tensor.
-
-    Projects down to target_dim, applies MLP, projects back up to highway_dim.
-    Element-wise operations on (B, N, N, D) with bottleneck architecture.
-    """
-
-    def __init__(self, highway_dim, target_dim):
+    """MLP residual block on pairwise feature tensor."""
+    def __init__(self, highway_dim, target_dim, dropout=0.0):
         super().__init__()
-
         self.mlp = nn.Sequential(
             StableRMSNorm(highway_dim),
             nn.Linear(highway_dim, target_dim * 2),
             SwiGLU(),
             nn.Linear(target_dim, highway_dim)
         )
-
+        self.dropout = nn.Dropout(dropout)
         self.res_scale = nn.Parameter(0.1 * torch.ones(highway_dim))
 
     def forward(self, e, mask):
         result = self.mlp(e)
+        result = self.dropout(result)  # <--- Drop out the update branch
+        
         mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)).unsqueeze(-1)
         result = result * mask_2d
         return e + self.res_scale * result
@@ -341,33 +324,18 @@ class Symmetrizer(nn.Module):
         
 
 
-_PAIRWISE_DIM = 48
+_PAIRWISE_DIM = 32
 
 
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
-    """Purely relational peeler using triangular edge updates.
-
-    Architecture:
-        1. Compute 22D relative features from transforms
-        2. Compute 4D pairwise features from embeddings
-        3. Concat features (26D) and project to highway_dim relational space
-        4. Stack of relational + MLP blocks with bottleneck
-        5. Project to 1-channel affinity logits
-
-    Input: embeddings(B,N,256), transforms(B,N,16), mask(B,N)
-    Output: affinity_logits(B,N,N)
-
-    Training: BCE loss on same-asset affinity matrix.
-    Inference: threshold + connected components for clustering.
-    """
-
-    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, **kwargs):
+    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, attn_dropout=0.0, output_dropout=0.0, **kwargs):
         super().__init__()
         self.downsample_schedule = list(downsample_schedule)
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
+        
         self.pairwise_head = nn.Sequential(
             nn.Linear(512, 512),
             SwiGLU(),
@@ -375,7 +343,7 @@ class PurelyRelationalPeeler(nn.Module):
         )
 
         _HIDDEN_REL = 32
-        _HIDDEN_FEATS = _PAIRWISE_DIM + _HIDDEN_REL
+        _HIDDEN_FEATS = _HIDDEN_REL + _PAIRWISE_DIM
 
         self.rel_head = nn.Sequential(
             nn.Linear(_REL_FEATURE_DIM, 64),
@@ -387,36 +355,43 @@ class PurelyRelationalPeeler(nn.Module):
             SwiGLU(),
             StableRMSNorm(_HIDDEN_FEATS),
             nn.Linear(_HIDDEN_FEATS, highway_dim),
+            nn.Dropout(pairwise_dropout),
         )
+        
         self.blocks = nn.ModuleList()
         for i, target_dim in enumerate(self.downsample_schedule):
             if i % 2 == 0:
-                self.blocks.append(RelationalAttentionBlock(highway_dim, target_dim))
+                self.blocks.append(RelationalAttentionBlock(
+                    highway_dim, 
+                    target_dim, 
+                    attn_dropout=attn_dropout, 
+                    proj_dropout=pairwise_dropout  # Pass pairwise dropout to projection
+                ))
             else:
-                self.blocks.append(PurelyRelationalBlock(highway_dim, target_dim))
+                self.blocks.append(PurelyRelationalBlock(
+                    highway_dim, 
+                    target_dim, 
+                    dropout=pairwise_dropout       # Pass pairwise dropout to projection
+                ))
 
             if self.mlp_sizes[i] > 0:
-                self.blocks.append(MLPBlock(highway_dim, target_dim))
+                self.blocks.append(MLPBlock(
+                    highway_dim, 
+                    target_dim, 
+                    dropout=pairwise_dropout       # Pass pairwise dropout to MLP
+                ))
 
         self.output_head = nn.Sequential(
             StableRMSNorm(highway_dim),
+            nn.Dropout(output_dropout),
             Symmetrizer(highway_dim, highway_dim),
             nn.Linear(highway_dim * 3, highway_dim),
             nn.GELU(),
             nn.Linear(highway_dim, 1)
         )
+        # REMOVED: self.block_dropout. Block regularizations are now internal.
 
     def forward(self, embeddings, transforms, mask):
-        """Forward pass.
-
-        Args:
-            embeddings: (B, N, 256) - fragment embeddings from backbone
-            transforms: (B, N, 16) - fragment transforms (4x4 pose matrices flattened)
-            mask: (B, N) - 1 for real fragments, 0 for padding
-
-        Returns:
-            affinity_logits: (B, N, N) - pairwise same-asset affinity logits
-        """
         B, N, _ = transforms.shape
         translation, scale, rot = transforms_to_pose(transforms, mask)
         rel_feats = compute_relative_features(
@@ -436,7 +411,7 @@ class PurelyRelationalPeeler(nn.Module):
 
         prod = emb_i * emb_j  # (B, N, N, 256)
 
-        pairwise_feats = torch.cat([abs_diff, emb_i - emb_j], dim=-1)  # (B, N, N, 512)
+        pairwise_feats = torch.cat([abs_diff, prod], dim=-1)  # (B, N, N, 512)
         pairwise_feats = self.pairwise_head(pairwise_feats)  # (B, N, N, 4)
         rel_feats = self.rel_head(rel_feats)
         

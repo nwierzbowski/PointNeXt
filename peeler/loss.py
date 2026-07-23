@@ -9,9 +9,10 @@ Curriculum: delta_var ramps down (loose→tight), delta_dist ramps up (small→l
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from openpoints.loss.build import LOSS
-import torch.nn.functional as F
+
 
 @LOSS.register_module()
 class SupervisedContrastiveLoss(nn.Module):
@@ -114,10 +115,9 @@ class BCEAffinityPeelerLoss(nn.Module):
         valid_mask = valid * diag_mask  # (B, N, N)
 
         # 1. Compute raw, unweighted per-element BCE
-        bce_per_element = self.bce(affinity_logits, Y)  # (B, N, N)
+        bce_per_element = self.bce(affinity_logits, (Y * 0.9) + 0.05)  # (B, N, N)
 
         # 2. Compute dynamic class weights PER-SAMPLE (keep batch dim as B, 1, 1)
-        # sum over spatial dimensions (1, 2) but preserve the batch dimension
         n_pos = (Y * valid_mask).sum(dim=(1, 2), keepdim=True)  # (B, 1, 1)
         total_active = valid_mask.sum(dim=(1, 2), keepdim=True) # (B, 1, 1)
         n_neg = total_active - n_pos                            # (B, 1, 1)
@@ -125,8 +125,6 @@ class BCEAffinityPeelerLoss(nn.Module):
         eps = 1e-6
         raw_pos_weight = total_active / (2.0 * n_pos + eps)
         raw_neg_weight = total_active / (2.0 * n_neg + eps)
-        # print("raw_pos_weight", torch.max(raw_pos_weight), torch.min(raw_pos_weight))
-        # print("raw_neg_weight", torch.max(raw_neg_weight), torch.min(raw_neg_weight))
         
         # Clamp to prevent extreme gradient updates on highly imbalanced samples
         dynamic_pos_weight = torch.clamp(raw_pos_weight, min=0.1, max=500)
@@ -149,7 +147,6 @@ class BCEAffinityPeelerLoss(nn.Module):
         pos_mask = (Y > 0.5) & (valid_mask > 0)
         neg_mask = (Y <= 0.5) & (valid_mask > 0)
         
-        # Use bce_per_element instead of weighted_bce to get clean, interpretable metrics
         pos_loss = bce_per_element[pos_mask].mean() if pos_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
         neg_loss = bce_per_element[neg_mask].mean() if neg_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
 
@@ -160,18 +157,19 @@ class BCEAffinityPeelerLoss(nn.Module):
         }
 
 
-
 @LOSS.register_module()
 class FocalAffinityPeelerLoss(nn.Module):
-    """Alpha-Balanced Focal Loss on pairwise affinity logits.
+    """Alpha-Balanced Focal Loss on pairwise affinity logits with Triplet Transitivity Penalty.
 
     Uses a fixed alpha constant for class balancing and the focal modulating
-    factor (1 - p_t)^gamma to silence easy negatives.
+    factor (1 - p_t)^gamma to silence easy negatives. Integrates a soft-AND
+    triplet transitivity penalty to eliminate cross-cluster bridge edges.
     """
-    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, **kwargs):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, transitivity_weight: float = 0.05, **kwargs):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.transitivity_weight = transitivity_weight
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, affinity_logits, Y, mask):
@@ -205,17 +203,49 @@ class FocalAffinityPeelerLoss(nn.Module):
         sample_counts = valid_mask.sum(dim=(1, 2))                     # (B,)
         
         active_samples_mask = sample_counts > 0
-        loss = (sample_sums[active_samples_mask] / sample_counts[active_samples_mask]).mean()
+        focal_loss = (sample_sums[active_samples_mask] / sample_counts[active_samples_mask]).mean()
 
-        # 6. Separate raw, unweighted pos/neg BCE for clean logging
+        # 6. Triplet Transitivity Penalty (uses exact valid_mask logic)
+        transitivity_loss = torch.tensor(0.0, device=affinity_logits.device)
+        if self.transitivity_weight > 0.0:
+            # Re-use valid_mask (padding + self-pair excluded) to form 3D triplet mask
+            valid_ij = (valid_mask > 0).unsqueeze(3)  # (B, N, N, 1)
+            valid_jk = (valid_mask > 0).unsqueeze(1)  # (B, 1, N, N)
+            valid_ik = (valid_mask > 0).unsqueeze(2)  # (B, N, 1, N)
+            valid_triplet_mask = valid_ij & valid_jk & valid_ik  # (B, N, N, N)
+
+            # Extract broadcasted pairwise probabilities
+            A_ij = probs.unsqueeze(3)  # (B, N, N, 1)
+            A_jk = probs.unsqueeze(1)  # (B, 1, N, N)
+            A_ik = probs.unsqueeze(2)  # (B, N, 1, N)
+
+            # Transitivity constraint: A_ij * A_jk predicts implied A_ik
+            implied_similarity = A_ij * A_jk
+            violation = torch.relu(implied_similarity - A_ik)  # (B, N, N, N)
+
+            # Compute masked transitivity loss per-sample
+            trans_bce = (violation ** 2) * valid_triplet_mask.float()
+            trans_sample_sums = trans_bce.sum(dim=(1, 2, 3))                     # (B,)
+            trans_sample_counts = valid_triplet_mask.float().sum(dim=(1, 2, 3)) # (B,)
+
+            active_trans_samples = trans_sample_counts > 0
+            if active_trans_samples.any():
+                transitivity_loss = (trans_sample_sums[active_trans_samples] / trans_sample_counts[active_trans_samples]).mean()
+
+        # 7. Total Combined Loss
+        total_loss = focal_loss + self.transitivity_weight * transitivity_loss
+
+        # 8. Separate raw, unweighted pos/neg BCE for clean logging
         pos_mask = (Y > 0.5) & (valid_mask > 0)
         neg_mask = (Y <= 0.5) & (valid_mask > 0)
         
         pos_loss = bce_per_element[pos_mask].mean() if pos_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
         neg_loss = bce_per_element[neg_mask].mean() if neg_mask.sum() > 0 else torch.tensor(0.0, device=affinity_logits.device)
 
-        return loss, {
-            'loss_total': loss.item(),
+        return total_loss, {
+            'loss_total': total_loss.item(),
+            'loss_focal': focal_loss.item(),
+            'loss_trans': transitivity_loss.item(),
             'loss_pos': pos_loss.item(),
             'loss_neg': neg_loss.item(),
         }
