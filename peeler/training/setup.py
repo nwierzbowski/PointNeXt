@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from openpoints.loss import build_criterion_from_cfg
 from openpoints.models.build import build_model_from_cfg
 from openpoints.utils import EasyConfig
+from ..curriculum import CurriculumManager
 
 
 def get_device(device):
@@ -18,62 +19,30 @@ def get_device(device):
     return torch.device(device)
 
 
-def build_peeler_dataset(cfg, all_embeddings, all_transforms, scene_transforms, scene_similarities=None):
-    """Build PeelerDataset from TBO data.
+def build_peeler_dataset(cfg, all_embeddings, all_transforms, asset_to_file=None, mode='train'):
+    """Build PeelerDataset for train or val.
 
     Args:
         cfg: EasyConfig with dataset settings
         all_embeddings: list of numpy arrays (N_i, 256), one per asset
         all_transforms: list of numpy arrays (N_i, 16), one per asset
-        scene_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
-        scene_similarities: list of numpy arrays (N_i, M_i) cluster indices for each scene (from transforms TBO)
+        asset_to_file: list mapping asset_idx -> scene_idx (scene = TBO file)
+        mode: 'train' or 'val'
 
     Returns:
         PeelerDataset instance
     """
     from peeler.dataset import PeelerDataset
     dataset_cfg = cfg.dataset
-    return PeelerDataset(
-        all_embeddings=all_embeddings,
-        all_transforms=all_transforms,
-        scene_transforms=scene_transforms,
-        scene_similarities=scene_similarities,
-        max_fragments=dataset_cfg.get('max_fragments', 700),
-        seed=dataset_cfg.get('seed', 42),
-        translation_scale=dataset_cfg.get('translation_scale', 0.0),
-        cluster_translation_scale=dataset_cfg.get('cluster_translation_scale', [1.6, 0.7]),
-        asset_scale_std=dataset_cfg.get('asset_scale_std', 1.0),
-        scene_scale=dataset_cfg.get('scene_scale', [0.8, 1.2]),
-        embedding_noise_sigma=dataset_cfg.get('embedding_noise_sigma', 0.0),
-        translation_noise_sigma=dataset_cfg.get('translation_noise_sigma', 0.0),
-        scaling_noise_sigma=dataset_cfg.get('scaling_noise_sigma', 0.0),
-        per_asset_rotation=dataset_cfg.get('per_asset_rotation', True),
-    )
-
-
-def build_peeler_val_dataset(cfg, all_embeddings, all_transforms, asset_to_file):
-    """Build PeelerValidationDataset from TBO data.
-
-    Each TBO file = one soup. No random mixing, no augmentation.
-
-    Args:
-        cfg: EasyConfig with dataset settings
-        all_embeddings: list of numpy arrays (N_i, 256), one per asset
-        all_transforms: list of numpy arrays (N_i, 16), one per asset
-        asset_to_file: list mapping asset_idx -> file_idx
-
-    Returns:
-        PeelerValidationDataset instance
-    """
-    from peeler.val_dataset import PeelerValidationDataset
-    dataset_cfg = cfg.dataset
-    return PeelerValidationDataset(
+    dataset = PeelerDataset(
+        mode=mode,
         all_embeddings=all_embeddings,
         all_transforms=all_transforms,
         asset_to_file=asset_to_file,
         max_fragments=dataset_cfg.get('max_fragments', 700),
         seed=dataset_cfg.get('seed', 42),
     )
+    return dataset
 
 
 def _load_checkpoint(model, checkpoint_path, train=False, optimizer=None, scheduler=None, device=None):
@@ -111,8 +80,7 @@ def setup(
     checkpoint_path=None,
     yaml_content=None,
     log_callback=None,
-    scene_transforms=None,
-    scene_similarities=None,
+    asset_to_file=None,
     test_embeddings=None,
     test_transforms=None,
     test_asset_to_file=None,
@@ -124,17 +92,15 @@ def setup(
         all_transforms: list of numpy arrays (N_i, 16), one per asset
         config_path: path to YAML config file
         checkpoint_path: path to checkpoint file (for resume)
-        mode: 'train'
         yaml_content: YAML config string from checkpoint
         log_callback: callable(str) for progress logging
-        scene_transforms: list of numpy arrays (N_i, 16), one per scene (from transforms TBO)
-        scene_similarities: list of numpy arrays (N_i, M_i) cluster indices for each scene (from transforms TBO)
+        asset_to_file: list mapping train asset_idx -> scene_idx (scene = TBO file)
         test_embeddings: list of numpy arrays (N_i, 256), one per test asset
         test_transforms: list of numpy arrays (N_i, 16), one per test asset
         test_asset_to_file: list mapping test asset_idx -> file_idx for validation soups
 
     Returns:
-        (model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device, num_epochs)
+        (model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device)
     """
     # Load config
     if yaml_content is not None:
@@ -149,16 +115,20 @@ def setup(
     if log_callback:
         log_callback(f'Device: {device}')
 
-    num_epochs = cfg.epochs
-
     batch_size = cfg.batch_size
+    batch_size_per_phase = cfg.get('batch_size_per_phase', [])
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
+    grad_accum_steps_per_phase = cfg.get('grad_accum_steps_per_phase', [])
 
     # Build train dataset
-    train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms, scene_transforms, scene_similarities)
+    train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms, asset_to_file, mode='train')
+    if batch_size_per_phase:
+        dl_batch_size = max(batch_size_per_phase)
+    else:
+        dl_batch_size = batch_size
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=dl_batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -168,11 +138,13 @@ def setup(
     )
     if log_callback:
         log_callback(f'Train dataset: {len(train_loader.dataset)} samples')
+        if hasattr(train_loader.dataset, 'get_bucket_stats'):
+            log_callback(train_loader.dataset.get_bucket_stats())
 
     # Build validation dataset (optional)
     val_loader = None
-    if test_embeddings is not None and test_transforms is not None:
-        val_dataset = build_peeler_val_dataset(cfg, test_embeddings, test_transforms, test_asset_to_file)
+    if test_embeddings is not None and test_transforms is not None and test_asset_to_file is not None:
+        val_dataset = build_peeler_dataset(cfg, test_embeddings, test_transforms, test_asset_to_file, mode='val')
         val_loader = DataLoader(
             val_dataset,
             batch_size=cfg.validation.get('batch_size', 1),
@@ -224,23 +196,15 @@ def setup(
     else:
         raise ValueError(f'Unknown optimizer: {optimizer_cfg.NAME}')
 
-    # Build scheduler (OneCycleLR with warmup + cosine decay)
+    # Build curriculum manager (phase-aware LR scheduler)
     scheduler_cfg = cfg.get('scheduler', {})
-    effective_steps_per_epoch = (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    eta_min = scheduler_cfg.get('eta_min', 1e-5)
+    scheduler = CurriculumManager(
         optimizer,
-        max_lr=cfg.lr,
-        epochs=num_epochs,
-        steps_per_epoch=effective_steps_per_epoch,
-        pct_start=cfg.lr_pct_start,
-        anneal_strategy='cos',
-        cycle_momentum=False,
-        div_factor=scheduler_cfg.get('div', 25.0),
-        final_div_factor=scheduler_cfg.get('final_div_factor', 10000.0),
+        eta_min=eta_min,
+        scheduler_cfg=scheduler_cfg,
+        log_callback=log_callback,
     )
-
-    # Attach num_epochs to criterion (used by loss.py for curriculum ramp)
-    criterion._num_epochs = num_epochs
 
     # AMP scaler
     use_amp = device.type == 'cuda'
@@ -257,4 +221,4 @@ def setup(
         if start_epoch > 0 and log_callback:
             log_callback(f'Resuming training from epoch {start_epoch}')
 
-    return model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device, num_epochs
+    return model, train_loader, val_loader, optimizer, scheduler, scaler, criterion, start_epoch, device

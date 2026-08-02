@@ -1,51 +1,63 @@
-batch_size: 4
+batch_size: 8
+batch_size_per_phase:
+- 8
+- 8
+- 8
+- 8
+- 8
+- 2
+- 1
 criterion:
-  NAME: FocalAffinityPeelerLoss
+  NAME: ClusterFocalPeelerLoss
+  gamma: 2.0
+  neg_weight: 0.5
+  pos_weight: 0.5
+  transitivity_weight: 0.0
 dataset:
-  asset_scale_std:
-  - 0.0
-  - 0.0
-  cluster_translation_scale:
-  - -30.0
-  - 30.0
-  max_fragments: 150
-  per_asset_rotation: true
-  scaling_noise_sigma: 0.0
-  scene_scale:
-  - 0.0
-  - 0.0
+  max_fragments: 600
   seed: 42
-  translation_noise_sigma: 0.0
-  translation_scale:
-  - 0.0
-  - 0.0
-embedding_noise_sigma: 0.0
-epochs: 20
-grad_accum_steps: 8
-lr: 0.0003
+grad_accum_steps: 4
+grad_accum_steps_per_phase:
+- 4
+- 4
+- 4
+- 4
+- 4
+- 16
+- 32
+lr: 0.0004
 lr_pct_start: 0.1
 model:
   NAME: PurelyRelationalPeeler
-  attn_dropout: 0.2
+  attn_dropout: 0.0
   downsample_schedule:
-  - 16
-  - 16
-  highway_dim: 16
+  - 12
+  - 12
+  - 12
+  - 12
+  highway_dim: 32
   mlp_sizes:
-  - 16
-  - 16
-  output_dropout: 0.2
-  pairwise_dropout: 0.3
+  - 32
+  - 32
+  - 32
+  - 32
+  output_dropout: 0.1
+  pairwise_dropout: 0.1
 optimizer:
   NAME: adamw
   weight_decay: 0.2
 scheduler:
-  div: 100.0
-  final_div_factor: 10.0
+  T_0: 20
+  T_0_growth: 1.0
+  eta_min: 1.0e-05
+  phase_decay: 1.0
+  phase_ramp_epochs: 20
+  ramp_epochs: 5
+  restart_decay: 0.95
 training:
   device: cuda
   ema_alpha: 0.0
-  report_interval: 100
+  report_interval: 10
 validation:
   batch_size: 1
   max_batches: 10

@@ -158,6 +158,118 @@ class BCEAffinityPeelerLoss(nn.Module):
 
 
 @LOSS.register_module()
+class ClusterFocalPeelerLoss(nn.Module):
+    """Cluster-Equalized Focal Loss for BOTH positive and negative pairs,
+    with Triplet Transitivity Penalty.
+
+    Positives: Equalized per-cluster (equal weight per asset).
+    Negatives: Equalized per-cluster (equal weight to isolating every asset).
+    Transitivity: Soft-AND triplet penalty to eliminate bridge edges.
+    """
+    def __init__(self, gamma: float = 2.0,
+                 pos_weight: float = 1.0, neg_weight: float = 2.0,
+                 transitivity_weight: float = 0.05, **kwargs):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+        self.neg_weight = neg_weight
+        self.transitivity_weight = transitivity_weight
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, affinity_logits, asset_ids, mask):
+        B, N, _ = affinity_logits.shape
+        device = asset_ids.device
+
+        # 1. Ground truth masks
+        same_cluster = (asset_ids.unsqueeze(1) == asset_ids.unsqueeze(2)).float()  # (B, N, N)
+        diag_mask = 1.0 - torch.eye(N, device=device).unsqueeze(0)
+        valid_mask = (mask.unsqueeze(1) * mask.unsqueeze(2)) * diag_mask  # (B, N, N)
+
+        # 2. Pure Focal Loss per element (No redundant alpha multiplier)
+        bce_per_element = self.bce(affinity_logits, same_cluster)  # (B, N, N)
+        probs = torch.sigmoid(affinity_logits)
+        p_t = torch.where(same_cluster > 0.5, probs, 1.0 - probs)
+        modulating_factor = (1.0 - p_t) ** self.gamma
+        focal_per_pair = bce_per_element * modulating_factor  # (B, N, N)
+
+        # Safe cluster index preparation for scatter_add_
+        cluster_offset = max(0, -int(asset_ids.min().item()))
+        safe_asset_ids = (asset_ids + cluster_offset).long()
+        max_cluster = int(asset_ids.max().item()) + cluster_offset + 2
+
+        # === 1. CLUSTER-EQUALIZED POSITIVE LOSS ===
+        pos_valid_mask = valid_mask * same_cluster
+        pos_focal = focal_per_pair * pos_valid_mask
+
+        pos_flat = pos_focal.view(B, -1)
+        pos_valid_flat = pos_valid_mask.view(B, -1)
+        pair_cluster_pos = safe_asset_ids.unsqueeze(2).expand(B, N, N).reshape(B, -1)
+
+        cluster_pos_sum = torch.zeros(B, max_cluster, device=device)
+        cluster_pos_count = torch.zeros(B, max_cluster, device=device)
+        cluster_pos_sum.scatter_add_(1, pair_cluster_pos, pos_flat)
+        cluster_pos_count.scatter_add_(1, pair_cluster_pos, pos_valid_flat)
+
+        cluster_pos_mean = cluster_pos_sum / (cluster_pos_count + 1e-8)
+        cluster_pos_mean = cluster_pos_mean.masked_fill(cluster_pos_count == 0, 0.0)
+        active_pos_clusters = (cluster_pos_count > 0).sum(dim=1).float()
+
+        sample_pos_loss = cluster_pos_mean.sum(dim=1) / (active_pos_clusters + 1e-8)
+        pos_loss = sample_pos_loss[active_pos_clusters > 0].mean() if (active_pos_clusters > 0).any() else torch.tensor(0.0, device=device)
+
+        # === 2. CLUSTER-EQUALIZED NEGATIVE LOSS ===
+        neg_valid_mask = valid_mask * (1.0 - same_cluster)
+        neg_focal = focal_per_pair * neg_valid_mask
+
+        node_neg_focal = (neg_focal * mask.unsqueeze(1)).sum(dim=2)
+        node_neg_count = (neg_valid_mask * mask.unsqueeze(1)).sum(dim=2)
+
+        cluster_neg_sum = torch.zeros(B, max_cluster, device=device)
+        cluster_neg_count = torch.zeros(B, max_cluster, device=device)
+        cluster_neg_sum.scatter_add_(1, safe_asset_ids, node_neg_focal)
+        cluster_neg_count.scatter_add_(1, safe_asset_ids, node_neg_count)
+
+        cluster_neg_mean = cluster_neg_sum / (cluster_neg_count + 1e-8)
+        cluster_neg_mean = cluster_neg_mean.masked_fill(cluster_neg_count == 0, 0.0)
+        active_neg_clusters = (cluster_neg_count > 0).sum(dim=1).float()
+
+        sample_neg_loss = cluster_neg_mean.sum(dim=1) / (active_neg_clusters + 1e-8)
+        neg_loss = sample_neg_loss[active_neg_clusters > 0].mean() if (active_neg_clusters > 0).any() else torch.tensor(0.0, device=device)
+
+        # === 3. TRIPLET TRANSITIVITY LOSS ===
+        transitivity_loss = torch.tensor(0.0, device=device)
+        if self.transitivity_weight > 0.0:
+            valid_ij = (valid_mask > 0).unsqueeze(3)
+            valid_jk = (valid_mask > 0).unsqueeze(1)
+            valid_ik = (valid_mask > 0).unsqueeze(2)
+            valid_triplet_mask = valid_ij & valid_jk & valid_ik
+
+            A_ij = probs.unsqueeze(3)
+            A_jk = probs.unsqueeze(1)
+            A_ik = probs.unsqueeze(2)
+
+            violation = torch.relu(A_ij * A_jk - A_ik)
+            trans_bce = (violation ** 2) * valid_triplet_mask.float()
+            
+            trans_sample_sums = trans_bce.sum(dim=(1, 2, 3))
+            trans_sample_counts = valid_triplet_mask.float().sum(dim=(1, 2, 3))
+
+            active_trans = trans_sample_counts > 0
+            if active_trans.any():
+                transitivity_loss = (trans_sample_sums[active_trans] / trans_sample_counts[active_trans]).mean()
+
+        # === TOTAL LOSS ===
+        total_loss = (self.pos_weight * pos_loss) + (self.neg_weight * neg_loss) + (self.transitivity_weight * transitivity_loss)
+
+        return total_loss, {
+            'loss_total': total_loss.item(),
+            'loss_pos': pos_loss.item(),
+            'loss_neg': neg_loss.item(),
+            'loss_trans': transitivity_loss.item(),
+        }
+
+
+@LOSS.register_module()
 class FocalAffinityPeelerLoss(nn.Module):
     """Alpha-Balanced Focal Loss on pairwise affinity logits with Triplet Transitivity Penalty.
 
