@@ -57,7 +57,7 @@ class SceneJoiner:
 
         Args:
             all_transforms: list of numpy arrays, one per asset, shape (N_i, 16)
-            bucket_order: list of bucket keys in ascending order (e.g. CURRICULUM_BUCKETS)
+            bucket_order: list of bucket keys in ascending order (e.g. FRAGMENT_RANGES keys)
         """
         self.all_transforms = all_transforms
         self.bucket_order = bucket_order

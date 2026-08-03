@@ -18,46 +18,11 @@ from torch.utils.data import Dataset
 from openpoints.dataset.build import DATASETS
 from .training.validate import FRAGMENT_RANGES
 from .scene_joiner import ROTATION_COLS, TRANSLATION_COLS, SceneJoiner
-from .curriculum import CURRICULUM_BUCKETS
 
-# Pool building config (stays in dataset — it owns the bucket structure)
-CURRICULUM_SAMPLES_PER_EPOCH = 2000
-CURRICULUM_MAX_REPEATS = 8
-MAX_BUCKET_SIZE = 1000
-
-
-def get_curriculum_samples_per_bucket(
-    current_bucket,
-    completed_buckets,
-    total_samples=1000,
-    current_weight=3,
-    previous_weight=1,
-):
-    """Allocates samples using a weighted uniform strategy:
-    - Current active bucket gets `current_weight` (default 2x).
-    - Each completed bucket gets `previous_weight` (default 1x).
-    """
-    samples_per_bucket = {}
-
-    if not completed_buckets:
-        samples_per_bucket[current_bucket] = total_samples
-        return samples_per_bucket
-
-    num_completed = len(completed_buckets)
-    total_weight = current_weight + (num_completed * previous_weight)
-
-    current_samples = int(total_samples * (current_weight / total_weight))
-    samples_per_bucket[current_bucket] = current_samples
-
-    remaining_samples = total_samples - current_samples
-    base_review_count = max(1, remaining_samples // num_completed)
-    remainder = remaining_samples % num_completed
-
-    for idx, bk in enumerate(completed_buckets):
-        extra = 1 if idx < remainder else 0
-        samples_per_bucket[bk] = base_review_count + extra
-
-    return samples_per_bucket
+# Pool building config
+SAMPLES_PER_EPOCH = 2000
+MAX_REPEATS = 16
+MAX_BUCKET_SIZE = 5000
 
 
 def _frag_to_range_key(frag: int) -> str:
@@ -161,7 +126,7 @@ class PeelerDataset(Dataset):
 
     def get_bucket_stats(self):
         """Return formatted bucket stats string for logging."""
-        all_buckets = ['1', '2-4', '5-11', '12-26', '27-51', '52-101', '102-300', '300+']
+        all_buckets = [item[1] for item in FRAGMENT_RANGES]
         lines = ['[Dataset] Scenes per bucket (raw / split / join / total):']
         total_raw = 0
         total_split = 0
@@ -262,7 +227,7 @@ class PeelerDataset(Dataset):
         them, and greedily accumulates into groups that fit the target bucket range.
         Each group becomes a new joined scene entry.
         """
-        joiner = SceneJoiner(self.all_transforms, CURRICULUM_BUCKETS)
+        joiner = SceneJoiner(self.all_transforms, [bk for _, bk in FRAGMENT_RANGES])
         next_idx = max(self._scene_assets.keys()) + 1
 
         for bucket_idx, (bucket_range, bucket_key) in enumerate(FRAGMENT_RANGES):
@@ -384,14 +349,11 @@ class PeelerDataset(Dataset):
 
             offset += n_frags
 
-    def set_epoch(self, epoch: int, phase: int, ramp_progress=1.0):
-        """Set the epoch and build the curriculum pool for the given phase.
+    def set_epoch(self, epoch: int):
+        """Set the epoch and build a uniform pool across all buckets.
 
         Args:
             epoch: Current training epoch number (for randomization seed)
-            phase: Current curriculum phase index (from CurriculumManager)
-            ramp_progress: 0.0-1.0 blend factor during phase ramp.
-                0.0 = 100% previous phase pool, 1.0 = 100% current phase pool.
         """
         self._epoch = epoch
 
@@ -399,41 +361,24 @@ class PeelerDataset(Dataset):
             self._epoch_pool = self._sorted_scenes[:]
             return
 
-        def _build_phase_pool(target_phase):
-            active_buckets = CURRICULUM_BUCKETS[:target_phase + 1]
-            total_samples = CURRICULUM_SAMPLES_PER_EPOCH
-            max_repeats = CURRICULUM_MAX_REPEATS
-            current_bucket = active_buckets[-1]
-            completed_buckets = [bk for bk in active_buckets[:-1] if self._bucket_scenes.get(bk)]
-            samples_per_bucket = get_curriculum_samples_per_bucket(
-                current_bucket, completed_buckets, total_samples=total_samples
-            )
-            pool = []
-            pool_rng = np.random.RandomState(self.seed + target_phase)
-            for bucket_key in active_buckets:
-                scenes = self._bucket_scenes.get(bucket_key, [])
-                if not scenes:
-                    continue
-                n_samples = samples_per_bucket.get(bucket_key, 1)
-                draws = [scenes[pool_rng.randint(0, len(scenes))] for _ in range(n_samples)]
-                counts = Counter(draws)
-                capped = []
-                for scene, count in counts.items():
-                    capped.extend([scene] * min(count, max_repeats))
-                pool.extend(capped)
-            pool_rng.shuffle(pool)
-            return pool if pool else self._sorted_scenes[:]
+        # Uniform sampling: equal samples from each non-empty bucket
+        active_buckets = [bk for _, bk in FRAGMENT_RANGES if self._bucket_scenes.get(bk)]
+        num_buckets = len(active_buckets)
+        samples_per_bucket = SAMPLES_PER_EPOCH // num_buckets
 
-        if ramp_progress < 1.0 and phase > 0:
-            prev_pool = _build_phase_pool(phase - 1)
-            curr_pool = _build_phase_pool(phase)
-            n_prev = int((1 - ramp_progress) * CURRICULUM_SAMPLES_PER_EPOCH)
-            n_curr = CURRICULUM_SAMPLES_PER_EPOCH - n_prev
-            n_prev = min(n_prev, len(prev_pool))
-            n_curr = min(n_curr, len(curr_pool))
-            self._epoch_pool = prev_pool[:n_prev] + curr_pool[:n_curr]
-        else:
-            self._epoch_pool = _build_phase_pool(phase)
+        pool = []
+        pool_rng = np.random.RandomState(self.seed + epoch)
+        for bucket_key in active_buckets:
+            scenes = self._bucket_scenes[bucket_key]
+            draws = [scenes[pool_rng.randint(0, len(scenes))] for _ in range(samples_per_bucket)]
+            counts = Counter(draws)
+            capped = []
+            for scene, count in counts.items():
+                capped.extend([scene] * min(count, MAX_REPEATS))
+            pool.extend(capped)
+
+        pool_rng.shuffle(pool)
+        self._epoch_pool = pool if pool else self._sorted_scenes[:]
 
     def __len__(self):
         if self._epoch_pool is not None:
@@ -441,7 +386,7 @@ class PeelerDataset(Dataset):
         return self._num_scenes
 
     def __getitem__(self, idx):
-        # Pick scene from epoch pool (curriculum) or sorted scenes (default)
+        # Pick scene from epoch pool (uniform bucket mixture) or sorted scenes (default)
         if self._epoch_pool is not None:
             scene_idx = self._epoch_pool[idx % len(self._epoch_pool)]
         else:
@@ -548,79 +493,33 @@ class PeelerDataset(Dataset):
     def collate_fn(datas):
         """Collate function for PeelerDataset.
 
-        Pads samples to the longest soup in the batch.
+        Flattens all scenes in the batch into a single tensor.
+        Pads each scene to >= top_k nodes with dummy nodes.
         """
-        max_n = max(len(d['embeddings']) for d in datas)
+        from .model import PurelyRelationalPeeler
+        top_k = 32
 
-        embeddings_list = []
-        transforms_list = []
-        Y_list = []
-        orig_indices_list = []
-        asset_ids_list = []
-        mask_list = []
-
-        # Pre-create a flat identity matrix for padding [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
         identity_flat = torch.eye(4).view(16)
-
-        # Pre-create an identity-like embedding pattern to avoid degenerate zero vectors.
-        # Uses a sparse pattern: first dim=1, rest=0, repeated to fill 256 dims.
-        # This gives the FeatureLift a structured (non-zero) input for padding nodes.
-        embedding_dim = 256
-        identity_emb = torch.zeros(1, embedding_dim, dtype=torch.float32)
+        identity_emb = torch.zeros(1, 256, dtype=torch.float32)
         identity_emb[0, 0] = 1.0
 
-        for d in datas:
+        embeddings_list, transforms_list, asset_ids_list, scene_ids_list, mask_list = [], [], [], [], []
+
+        for i, d in enumerate(datas):
             n = len(d['embeddings'])
-            pad_size = max_n - n
+            pad = max(0, top_k - n)
 
-            mask =  torch.cat([torch.ones(n), torch.zeros(pad_size)])
-            mask_list.append(mask)
-
-            if pad_size > 0:
-                embeddings_list.append(
-                    torch.cat([
-                        d['embeddings'],
-                        identity_emb.repeat(pad_size, 1),
-                    ], dim=0)
-                )
-                transforms_list.append(
-                    torch.cat([
-                        d['transforms'],
-                        identity_flat.repeat(pad_size, 1),
-                    ], dim=0)
-                )
-                Y_list.append(
-                    torch.cat([
-                        torch.cat([d['Y'], torch.zeros(n, pad_size, dtype=torch.bool)], dim=1),
-                        torch.zeros(pad_size, max_n, dtype=torch.bool),
-                    ], dim=0)
-                )
-                orig_indices_list.append(
-                    torch.cat([
-                        d['orig_indices'],
-                        torch.full((pad_size,), -999, dtype=torch.int64),
-                    ], dim=0)
-                )
-                asset_ids_list.append(
-                    torch.cat([
-                        d['asset_ids'],
-                        torch.full((pad_size,), -1, dtype=torch.int64),
-                    ], dim=0)
-                )
-            else:
-                embeddings_list.append(d['embeddings'])
-                transforms_list.append(d['transforms'])
-                Y_list.append(d['Y'])
-                orig_indices_list.append(d['orig_indices'])
-                asset_ids_list.append(d['asset_ids'])
+            embeddings_list.append(torch.cat([d['embeddings'], identity_emb.repeat(pad, 1)]))
+            transforms_list.append(torch.cat([d['transforms'], identity_flat.repeat(pad, 1)]))
+            asset_ids_list.append(torch.cat([d['asset_ids'], torch.full((pad,), -1, dtype=torch.int64)]))
+            scene_ids_list.append(torch.full((n + pad,), i, dtype=torch.int64))
+            mask_list.append(torch.cat([torch.ones(n), torch.zeros(pad)]))
 
         return {
-            'embeddings': torch.stack(embeddings_list),
-            'transforms': torch.stack(transforms_list),
-            'Y': torch.stack(Y_list),
-            'orig_indices': torch.stack(orig_indices_list),
-            'asset_ids': torch.stack(asset_ids_list),
-            'mask': torch.stack(mask_list), # [B, N]
-            'soup_count': torch.tensor([d['soup_count'] for d in datas], dtype=torch.float32),
+            'embeddings': torch.cat(embeddings_list),
+            'transforms': torch.cat(transforms_list),
+            'asset_ids': torch.cat(asset_ids_list),
+            'scene_ids': torch.cat(scene_ids_list),
+            'mask': torch.cat(mask_list),
             'soup_stats': [d['soup_stats'] for d in datas],
         }

@@ -3,10 +3,9 @@ import numpy as np
 import torch
 from sklearn.metrics import adjusted_rand_score
 from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import pdist
 from concurrent.futures import ThreadPoolExecutor
 
-# Try using fastcluster if installed (drop-in 10x faster C++ replacement for scipy.cluster.hierarchy.linkage)
 try:
     import fastcluster
     fast_linkage = fastcluster.linkage
@@ -15,8 +14,7 @@ except ImportError:
 
 FRAGMENT_RANGES = [
     ((1, 2), '1'),
-    ((2, 5), '2-4'),
-    ((5, 12), '5-11'),
+    ((2, 12), '2-11'),
     ((12, 27), '12-26'),
     ((27, 52), '27-51'),
     ((52, 102), '52-101'),
@@ -44,15 +42,23 @@ def _eval_single_sample_ari(b_affinities, gt_labels, thresholds):
     if N <= 1:
         return None
 
-    # Fill diagonal with 1.0 (exact match to original code)
     A = b_affinities.copy()
     np.fill_diagonal(A, 1.0)
 
-    # Condensed form & linkage
+    # Protect against NaN/Inf in affinity matrix
+    A = np.nan_to_num(A, nan=0.5, posinf=1.0, neginf=0.0)
+
+    # Protect against zero-norm rows (cosine distance undefined)
+    norms = np.linalg.norm(A, axis=1)
+    zero_mask = norms < 1e-10
+    A[zero_mask] = 0.0
+    np.fill_diagonal(A, 1.0)  # Re-fill diagonal after zeroing
+
     condensed_dist = pdist(A, metric='cosine')
+    condensed_dist = np.nan_to_num(condensed_dist, nan=2.0)
+
     Z = fast_linkage(condensed_dist, method='average')
 
-    # Fast evaluation at unique merge heights
     merge_heights = Z[:, 2]
     k_indices = np.searchsorted(merge_heights, thresholds, side='right')
     unique_ks = np.unique(k_indices)
@@ -82,7 +88,6 @@ def validate(model, val_loader, criterion, device, max_batches=None):
     thresholds_tensor = torch.from_numpy(thresholds_np).to(device, dtype=torch.float32)  # [100]
     num_thresholds = len(thresholds_np)
 
-    # Initialize tracking structures
     ari_sums = np.zeros(num_thresholds, dtype=np.float64)
     tp_sums = np.zeros(num_thresholds, dtype=np.int64)
     fp_sums = np.zeros(num_thresholds, dtype=np.int64)
@@ -109,95 +114,109 @@ def validate(model, val_loader, criterion, device, max_batches=None):
 
             embeddings = batch['embeddings'].to(device)
             transforms = batch['transforms'].to(device)
-            mask = batch['mask'].to(device)
-            Y = batch['Y'].to(device).float()
             asset_ids = batch['asset_ids'].to(device)
+            scene_ids = batch.get('scene_ids', None)
+            mask = batch.get('mask', None)
+
+            if scene_ids is not None:
+                scene_ids = scene_ids.to(device)
+            if mask is not None:
+                mask = mask.to(device)
+            else:
+                mask = torch.ones(embeddings.shape[0], device=device)
 
             soup_stats = batch.get('soup_stats', [])
-            B, N = embeddings.shape[0], embeddings.shape[1]
 
-            # Forward pass
             with torch.amp.autocast(device_type=device_type):
-                affinity_logits = model(embeddings, transforms, mask)
-                loss, _ = criterion(affinity_logits, asset_ids, mask)
+                scene_logits = model(embeddings, transforms, scene_ids, mask)
+                loss, _ = criterion(scene_logits, asset_ids, scene_ids, mask)
 
-            total_loss += loss.item() * B
+            if isinstance(scene_logits, dict):
+                scenes = scene_logits
+            else:
+                scenes = {0: scene_logits}
+
+            # Accumulate loss weighted by scene count
+            num_scenes_in_batch = len(scenes)
+            total_loss += loss.item() * num_scenes_in_batch
             num_batches += 1
-            total_samples += B
-
-            # Compute probabilities on GPU
-            affinity_probs = torch.sigmoid(affinity_logits)  # [B, N, N]
-            soft_A = affinity_probs.cpu().numpy()             # [B, N, N] CPU NumPy array
-
-            # ---------------------------------------------------------
-            # 1. VECTORIZED F1 CALCULATION ON GPU
-            # ---------------------------------------------------------
-            mask_2d = (mask.unsqueeze(1) * mask.unsqueeze(2)) > 0.5  # [B, N, N]
-            diag_mask = (1.0 - torch.eye(N, device=device)).unsqueeze(0) > 0.5  # [B, N, N]
-            valid_pair_mask = mask_2d & diag_mask  # [B, N, N]
-
-            # Reshape for broadcast against thresholds: [B, N, N, 100]
-            preds = affinity_probs.unsqueeze(-1) > thresholds_tensor.view(1, 1, 1, -1)
-            targets = (Y.unsqueeze(-1) > 0.5) & valid_pair_mask.unsqueeze(-1)
-
-            tp_batch = (targets & preds).sum(dim=(1, 2)).cpu().numpy()  # [B, 100]
-            fp_batch = ((~targets) & preds & valid_pair_mask.unsqueeze(-1)).sum(dim=(1, 2)).cpu().numpy()
-            fn_batch = (targets & (~preds)).sum(dim=(1, 2)).cpu().numpy()
 
             asset_ids_np = asset_ids.cpu().numpy()
+            scene_ids_np = scene_ids.cpu().numpy() if scene_ids is not None else np.zeros(len(asset_ids), dtype=int)
             mask_np = mask.cpu().numpy()
 
-            # Prepare items for CPU linkage worker
-            cpu_tasks = []
-            sample_keys = []
+            scene_data = []
+            for scene_idx, logits in scenes.items():
+                scene_node_mask = (scene_ids_np == scene_idx)
+                all_scene_idx = np.where(scene_node_mask)[0]
+                active_idx = np.where(scene_node_mask & (mask_np > 0.5))[0]
 
-            for b in range(B):
+                # Direct scene_idx lookup for soup_stats
                 range_key = None
-                if soup_stats and b < len(soup_stats):
-                    actual_n = soup_stats[b].get('actual_n', 0)
+                if soup_stats and scene_idx < len(soup_stats):
+                    actual_n = soup_stats[scene_idx].get('actual_n', 0)
                     range_key = _frag_to_range_key(actual_n)
 
-                sample_keys.append(range_key)
+                global_to_local = {g: l for l, g in enumerate(all_scene_idx)}
+                local_active = np.array([global_to_local[g] for g in active_idx])
 
-                active_idx = np.where(mask_np[b] > 0.5)[0]
-                if len(active_idx) <= 1:
-                    cpu_tasks.append(None)
-                else:
-                    b_aff = soft_A[b][active_idx][:, active_idx]
-                    b_gt = asset_ids_np[b][active_idx]
-                    cpu_tasks.append((b_aff, b_gt))
+                soft_A_full = torch.sigmoid(logits).cpu().numpy()
+                soft_A = soft_A_full[local_active][:, local_active]
+                scene_asset_ids_np = asset_ids_np[active_idx]
+                scene_logits = logits[local_active][:, local_active]
 
-            # ---------------------------------------------------------
-            # 2. CPU ARI COMPUTATION (Threaded across batch items)
-            # ---------------------------------------------------------
-            def worker(task):
-                if task is None:
+                scene_data.append({
+                    'scene_idx': scene_idx,
+                    'soft_A': soft_A,
+                    'gt_labels': scene_asset_ids_np,
+                    'active_count': len(active_idx),
+                    'range_key': range_key,
+                    'logits': scene_logits,
+                })
+
+            def worker(sd):
+                if sd['active_count'] <= 1:
                     return None
-                return _eval_single_sample_ari(task[0], task[1], thresholds_np)
+                return _eval_single_sample_ari(sd['soft_A'], sd['gt_labels'], thresholds_np)
 
             with ThreadPoolExecutor() as executor:
-                ari_results = list(executor.map(worker, cpu_tasks))
+                ari_results = list(executor.map(worker, scene_data))
 
-            # Accumulate metrics
-            for b in range(B):
-                range_key = sample_keys[b]
+            for i, sd in enumerate(scene_data):
+                range_key = sd['range_key']
                 track_bucket = range_key is not None and range_key in buckets
+                N_s = sd['active_count']
 
-                # F1 accumulation
-                tp_sums += tp_batch[b]
-                fp_sums += fp_batch[b]
-                fn_sums += fn_batch[b]
+                if N_s <= 1:
+                    continue
+
+                total_samples += 1
+
+                # GPU Vectorized F1 Computation
+                probs = torch.sigmoid(sd['logits'])
+                diag_mask = (1.0 - torch.eye(N_s, device=device)) > 0.5
+
+                preds = probs.unsqueeze(-1) > thresholds_tensor.view(1, 1, -1)
+                scene_aids_t = torch.from_numpy(sd['gt_labels']).to(device)
+                targets = (scene_aids_t.unsqueeze(1) == scene_aids_t.unsqueeze(0)).unsqueeze(-1) & diag_mask.unsqueeze(-1)
+
+                tp_scene = (targets & preds).sum(dim=(0, 1)).cpu().numpy()
+                fp_scene = ((~targets) & preds & diag_mask.unsqueeze(-1)).sum(dim=(0, 1)).cpu().numpy()
+                fn_scene = (targets & (~preds)).sum(dim=(0, 1)).cpu().numpy()
+
+                tp_sums += tp_scene
+                fp_sums += fp_scene
+                fn_sums += fn_scene
 
                 if track_bucket:
                     bucket = buckets[range_key]
-                    bucket['tp_sums'] += tp_batch[b]
-                    bucket['fp_sums'] += fp_batch[b]
-                    bucket['fn_sums'] += fn_batch[b]
+                    bucket['tp_sums'] += tp_scene
+                    bucket['fp_sums'] += fp_scene
+                    bucket['fn_sums'] += fn_scene
                     bucket['loss_sum'] += loss.item()
                     bucket['sample_count'] += 1
 
-                # ARI accumulation
-                b_ari = ari_results[b]
+                b_ari = ari_results[i]
                 if b_ari is not None:
                     valid_sample_count_ari += 1
                     ari_sums += b_ari
@@ -208,7 +227,7 @@ def validate(model, val_loader, criterion, device, max_batches=None):
     # Finalize global metrics
     avg_loss = total_loss / max(total_samples, 1)
 
-    # Compute best global ARI
+    # Best global ARI
     best_ari = -1.0
     best_ari_threshold = 0.5
     if valid_sample_count_ari > 0:
@@ -217,7 +236,7 @@ def validate(model, val_loader, criterion, device, max_batches=None):
         best_ari = float(avg_ari_per_t[best_t_idx])
         best_ari_threshold = float(thresholds_np[best_t_idx])
 
-    # Compute best global F1
+    # Best global F1
     precisions = np.where((tp_sums + fp_sums) > 0, tp_sums / (tp_sums + fp_sums), 0.0)
     recalls = np.where((tp_sums + fn_sums) > 0, tp_sums / (tp_sums + fn_sums), 0.0)
     f1_scores = np.where((precisions + recalls) > 0, 2 * precisions * recalls / (precisions + recalls), 0.0)
@@ -226,7 +245,7 @@ def validate(model, val_loader, criterion, device, max_batches=None):
     best_f1 = float(f1_scores[best_f1_idx])
     best_f1_threshold = float(thresholds_np[best_f1_idx])
 
-    # Compute bucket metrics
+    # Bucket metrics
     bucket_metrics = {}
     for range_key, bucket in buckets.items():
         if bucket['sample_count'] == 0:
@@ -234,13 +253,11 @@ def validate(model, val_loader, criterion, device, max_batches=None):
 
         b_loss = bucket['loss_sum'] / bucket['sample_count']
 
-        # Bucket ARI
         b_best_ari = -1.0
         if bucket['valid_sample_count_ari'] > 0:
             b_avg_ari = bucket['ari_sums'] / bucket['valid_sample_count_ari']
             b_best_ari = float(np.max(b_avg_ari))
 
-        # Bucket F1
         b_tp, b_fp, b_fn = bucket['tp_sums'], bucket['fp_sums'], bucket['fn_sums']
         b_prec = np.where((b_tp + b_fp) > 0, b_tp / (b_tp + b_fp), 0.0)
         b_rec = np.where((b_tp + b_fn) > 0, b_tp / (b_tp + b_fn), 0.0)

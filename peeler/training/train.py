@@ -6,9 +6,8 @@ from pathlib import Path
 
 import torch
 
-from ..curriculum import CURRICULUM_BUCKETS
 from .utils import save_checkpoint
-from .validate import validate
+from .validate import FRAGMENT_RANGES, validate
 
 _TRAIN_YAML_PATH = None
 _TRAIN_YAML_CONTENT = None
@@ -33,14 +32,13 @@ def peeler_train(
     """Full peeler training pipeline.
 
     Reads peeler.yaml for all config values, handles checkpoint saving internally.
-    Runs indefinitely until stopped via stop_callback.
 
     Args:
         model: Peeler model
         train_loader: Training data loader
         val_loader: Validation data loader
         optimizer: Optimizer
-        scheduler: LR scheduler
+        scheduler: LR scheduler (SequentialLR: warmup + cosine)
         scaler: AMP scaler (None if not using AMP)
         criterion: Loss function
         device: Device string (e.g., 'cuda')
@@ -77,9 +75,8 @@ def peeler_train(
 
     # 4. Internal train() — called with all config loaded
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
-    batch_size_per_phase = cfg.get('batch_size_per_phase', [])
-    grad_accum_steps_per_phase = cfg.get('grad_accum_steps_per_phase', [])
     max_batches = cfg.get('validation', {}).get('max_batches')
+    num_epochs = cfg.get('num_epochs', 200)
 
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
@@ -87,11 +84,10 @@ def peeler_train(
         criterion=criterion,
         scaler=scaler,
         start_epoch=start_epoch,
+        num_epochs=num_epochs,
         report_interval=report_interval,
         best_metric=best_metric,
         grad_accum_steps=grad_accum_steps,
-        batch_size_per_phase=batch_size_per_phase,
-        grad_accum_steps_per_phase=grad_accum_steps_per_phase,
         max_batches=max_batches,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
@@ -103,9 +99,9 @@ def peeler_train(
 
 def _make_checkpoint_callback():
     """Create checkpoint callback that embeds yaml_content."""
-    def save_ckpt(model, opt, epoch, loss, path, scheduler=None,
+    def save_ckpt(model, opt, epoch, loss, path,
                   best_metric=None, best_metric_value=None):
-        save_checkpoint(model, opt, epoch, loss, path, scheduler,
+        save_checkpoint(model, opt, epoch, loss, path,
                         yaml_content=_TRAIN_YAML_CONTENT,
                         best_metric=best_metric,
                         best_metric_value=best_metric_value)
@@ -131,34 +127,20 @@ def _train(
     report_interval=10,
     best_metric='ari',
     grad_accum_steps=1,
-    batch_size_per_phase=None,
-    grad_accum_steps_per_phase=None,
     max_batches=None,
+    num_epochs=200,
 ):
-    """Run the training epoch loop (infinite, competence-based curriculum)."""
+    """Run the training epoch loop with cosine annealing LR schedule."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
     best_epoch = 0
     global_step = 0
     report_loss = 0.0
     graph_loss = 0.0
-    original_base_wd = optimizer.param_groups[0].get('weight_decay', 0.1)
-    epoch = start_epoch
 
-    num_phases = len(CURRICULUM_BUCKETS)
+    for epoch in range(start_epoch + 1, num_epochs + 1):
+        train_loader.dataset.set_epoch(epoch)
+        effective_grad_accum = grad_accum_steps
 
-    def _resolve_per_phase(per_phase_list, fallback):
-        if not per_phase_list:
-            return [fallback] * num_phases
-        if len(per_phase_list) < num_phases:
-            per_phase_list = list(per_phase_list) + [per_phase_list[-1]] * (num_phases - len(per_phase_list))
-        return per_phase_list[:num_phases]
-
-    while True:
-        epoch += 1
-        train_loader.dataset.set_epoch(epoch, scheduler.phase, scheduler.ramp_progress)
-        curriculum_phase_label = scheduler.phase_label
-        effective_grad_accum = _resolve_per_phase(grad_accum_steps_per_phase, grad_accum_steps)[scheduler.phase]
-        
         epoch_start_time = time.time()
 
         model.train()
@@ -166,15 +148,15 @@ def _train(
         num_batches = 0
         stopped = False
         use_amp = scaler is not None
-        
 
         step_loss_accum = 0.0
         for batch_idx, batch in enumerate(train_loader):
             dtype = torch.bfloat16 if use_amp else torch.float32
             embeddings = batch['embeddings'].to(device, dtype=dtype, non_blocking=True)
             transforms = batch['transforms'].to(device, dtype=dtype, non_blocking=True)
-            mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
             asset_ids = batch['asset_ids'].to(device, dtype=torch.long, non_blocking=True)
+            scene_ids = batch['scene_ids'].to(device, non_blocking=True)
+            mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
 
             is_accum_start = batch_idx % effective_grad_accum == 0
             if is_accum_start:
@@ -182,8 +164,8 @@ def _train(
                 step_loss_accum = 0.0
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-                out_embeddings = model(embeddings, transforms, mask)
-                loss, loss_dict = criterion(out_embeddings, asset_ids, mask)
+                scene_logits = model(embeddings, transforms, scene_ids, mask)
+                loss, loss_dict = criterion(scene_logits, asset_ids, scene_ids, mask)
 
             step_loss_accum += loss.item()
 
@@ -199,7 +181,6 @@ def _train(
                 if use_amp:
                     scaler.unscale_(optimizer)
                 grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-                # print(f"[GRAD] grad_norm={grad_norm_before_clip:.4f}")
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
@@ -228,13 +209,11 @@ def _train(
                     iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
                     lr = optimizer.param_groups[0]['lr']
                     log_callback(
-                        f'Step {global_step} (epoch {epoch}) - '
+                        f'Step {global_step} (epoch {epoch}/{num_epochs}) - '
                         f'Loss: {report_loss / report_interval:.4f} | LR: {lr:.6f} | '
                         f'{iters_per_sec:.1f} it/s'
                     )
                     report_loss = 0
-                
-                
 
             if stop_callback and stop_callback():
                 if log_callback:
@@ -244,6 +223,9 @@ def _train(
 
         if stopped:
             break
+
+        # Step LR scheduler at end of epoch
+        scheduler.step()
 
         avg_loss = total_loss / max(num_batches, 1)
 
@@ -275,10 +257,6 @@ def _train(
         train_ari_thres = train_results['best_ari_threshold']
         train_f1_thres = train_results['best_f1_threshold']
 
-        # Step LR scheduler (per-epoch) — reports ARI, advances phase, steps LR
-        train_bucket_ari = train_results.get('bucket_metrics', {})
-        scheduler.step(train_bucket_ari)
-
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
             # Build per-bucket summary strings
@@ -286,7 +264,7 @@ def _train(
                 if not bucket_metrics:
                     return None
                 entries = []
-                for range_key in ['1', '2-4', '5-11', '12-26', '27-51', '52-101', '102-300', '300+']:
+                for range_key in [item[1] for item in FRAGMENT_RANGES]:
                     if range_key in bucket_metrics:
                         bm = bucket_metrics[range_key]
                         entries.append((range_key, bm))
@@ -298,14 +276,13 @@ def _train(
             train_buckets = format_bucket_metrics(train_results.get('bucket_metrics', {}))
 
             # Overall metrics line
-            phase_str = f' | Phase: {curriculum_phase_label}' if curriculum_phase_label else ''
-            log_msg = f'Epoch {epoch}{phase_str} | LR: {lr:.2e} | Loss: {avg_loss:.4f}\n'
+            log_msg = f'Epoch {epoch}/{num_epochs} | LR: {lr:.2e} | Loss: {avg_loss:.4f}\n'
             log_msg += f'  Val: Loss={val_loss:.3f} ARI={val_ari:.3f} F1={val_f1:.3f} (ARI@{val_ari_thres:.2f} F1@{val_f1_thres:.2f})\n'
             log_msg += f'  Trn: Loss={train_loss:.3f} ARI={train_ari:.3f} F1={train_f1:.3f} (ARI@{train_ari_thres:.2f} F1@{train_f1_thres:.2f})'
 
             # Bucket metrics - side by side val/train, one per line
             all_buckets = []
-            for range_key in ['1', '2-4', '5-11', '12-26', '27-51', '52-101', '102-300', '300+']:
+            for range_key in [item[1] for item in FRAGMENT_RANGES]:
                 val_bm = val_buckets and any(k == range_key for k, _ in val_buckets)
                 train_bm = train_buckets and any(k == range_key for k, _ in train_buckets)
                 if val_bm or train_bm:
@@ -339,17 +316,17 @@ def _train(
             best_epoch = epoch
             ckpt_path = os.path.join(checkpoint_dir, f'best_{best_metric}.pth')
             if save_checkpoint_callback:
-                save_checkpoint_callback(model, optimizer, epoch, current_metric, ckpt_path, scheduler,
-                                         best_metric=best_metric, best_metric_value=current_metric)
+                save_checkpoint_callback(model, optimizer, epoch, current_metric, ckpt_path,
+                                         best_metric=best_metric, best_metric_value=best_metric_value)
             else:
-                save_checkpoint(model, optimizer, epoch, current_metric, ckpt_path, scheduler,
-                                best_metric=best_metric, best_metric_value=current_metric)
+                save_checkpoint(model, optimizer, epoch, current_metric, ckpt_path,
+                                best_metric=best_metric, best_metric_value=best_metric_value)
 
         if epoch % 10 == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch}.pth')
             if save_checkpoint_callback:
-                save_checkpoint_callback(model, optimizer, epoch, val_loss, ckpt_path, scheduler)
+                save_checkpoint_callback(model, optimizer, epoch, val_loss, ckpt_path)
             else:
-                save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path, scheduler)
+                save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path)
 
     return best_metric, best_metric_value, best_epoch

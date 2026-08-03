@@ -2,7 +2,7 @@
 import torch
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path, scheduler=None, yaml_content=None,
+def save_checkpoint(model, optimizer, epoch, loss, path, yaml_content=None,
                     best_metric=None, best_metric_value=None):
     """Save model checkpoint."""
     state = {

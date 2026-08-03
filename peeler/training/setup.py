@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 from openpoints.loss import build_criterion_from_cfg
 from openpoints.models.build import build_model_from_cfg
 from openpoints.utils import EasyConfig
-from ..curriculum import CurriculumManager
 
 
 def get_device(device):
@@ -45,7 +44,7 @@ def build_peeler_dataset(cfg, all_embeddings, all_transforms, asset_to_file=None
     return dataset
 
 
-def _load_checkpoint(model, checkpoint_path, train=False, optimizer=None, scheduler=None, device=None):
+def _load_checkpoint(model, checkpoint_path, train=False, optimizer=None, device=None):
     """Load checkpoint weights."""
     import os
     if not os.path.exists(checkpoint_path):
@@ -116,19 +115,17 @@ def setup(
         log_callback(f'Device: {device}')
 
     batch_size = cfg.batch_size
-    batch_size_per_phase = cfg.get('batch_size_per_phase', [])
+    num_epochs = cfg.get('num_epochs', 200)
+    lr_pct_start = cfg.get('lr_pct_start', 0.1)
+    eta_min = cfg.get('eta_min', 1e-5)
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
-    grad_accum_steps_per_phase = cfg.get('grad_accum_steps_per_phase', [])
+    warmup_epochs = max(1, int(num_epochs * lr_pct_start))
 
     # Build train dataset
     train_dataset = build_peeler_dataset(cfg, all_embeddings, all_transforms, asset_to_file, mode='train')
-    if batch_size_per_phase:
-        dl_batch_size = max(batch_size_per_phase)
-    else:
-        dl_batch_size = batch_size
     train_loader = DataLoader(
         train_dataset,
-        batch_size=dl_batch_size,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -183,7 +180,7 @@ def setup(
             no_decay.append(param)
         else:
             decay.append(param)
-            
+
     param_groups = [
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0}
@@ -196,15 +193,21 @@ def setup(
     else:
         raise ValueError(f'Unknown optimizer: {optimizer_cfg.NAME}')
 
-    # Build curriculum manager (phase-aware LR scheduler)
-    scheduler_cfg = cfg.get('scheduler', {})
-    eta_min = scheduler_cfg.get('eta_min', 1e-5)
-    scheduler = CurriculumManager(
-        optimizer,
-        eta_min=eta_min,
-        scheduler_cfg=scheduler_cfg,
-        log_callback=log_callback,
+    # Build LR scheduler: linear warmup + cosine annealing
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0 / warmup_epochs, end_factor=1.0, total_iters=warmup_epochs
     )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs - warmup_epochs, eta_min=eta_min
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
+    if log_callback:
+        log_callback(f'LR schedule: {warmup_epochs} warmup + {num_epochs - warmup_epochs} cosine, eta_min={eta_min}')
 
     # AMP scaler
     use_amp = device.type == 'cuda'
@@ -217,7 +220,7 @@ def setup(
     if checkpoint_path:
         if log_callback:
             log_callback(f'Loading checkpoint: {checkpoint_path}')
-        start_epoch, _, _ = _load_checkpoint(model, checkpoint_path, train=True, optimizer=optimizer, scheduler=scheduler, device=device)
+        start_epoch, _, _ = _load_checkpoint(model, checkpoint_path, train=True, optimizer=optimizer, device=device)
         if start_epoch > 0 and log_callback:
             log_callback(f'Resuming training from epoch {start_epoch}')
 
