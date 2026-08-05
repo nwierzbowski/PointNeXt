@@ -294,14 +294,14 @@ class PurelyRelationalPeeler(nn.Module):
         N_total = embeddings.shape[0]
         K = self.top_k
 
-        # Unified path: always use _get_topk_neighbors_scene for memory-efficient KNN
-        if scene_ids is None:
-            scene_ids = torch.zeros(N_total, dtype=torch.long, device=embeddings.device)
-
         translation, scale, rot = transforms_to_pose(transforms)
-        topk_indices, candidate_mask = self._get_topk_neighbors_scene(
-            translation, scene_ids, K
-        )
+        
+        if scene_ids is None:
+            topk_indices, candidate_mask = self._get_topk_neighbors_single(translation, K)
+        else:
+            topk_indices, candidate_mask = self._get_topk_neighbors_scene(
+                translation, scene_ids, K
+            )
 
         rel_feats = compute_relative_features(
             translation, scale.squeeze(-1),
@@ -328,8 +328,38 @@ class PurelyRelationalPeeler(nn.Module):
         logits = self.output_head(e).squeeze(-1)  # (N_total, K)
         return logits, topk_indices, candidate_mask
 
+    def _get_topk_neighbors_single(self, translation, k):
+        """Single-scene KNN: fully vectorized, ONNX-compatible (no loops).
+
+        Excludes self-relations. Pads to K via modulo indexing when N < K.
+        """
+        N_total = translation.shape[0]
+        device = translation.device
+
+        # Compute pairwise distance matrix (N, N)
+        diff = translation.unsqueeze(0) - translation.unsqueeze(1)  # (N, N, 3)
+        dist = torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # (N, N)
+
+        # Exclude self-relations (dist=0 provides no useful signal)
+        row_idx = torch.arange(N_total, device=device).unsqueeze(1)
+        col_idx = torch.arange(N_total, device=device).unsqueeze(0)
+        dist = dist.masked_fill(row_idx == col_idx, float('inf'))
+
+        # Sort distances ascending (N, N)
+        sorted_indices = torch.argsort(dist, dim=-1)  # (N, N)
+
+        # Dynamic Modulo Padding (handles N < K for any N >= 1)
+        k_range = torch.arange(k, device=device)        # (K,)
+        pad_indices = k_range % N_total                 # (K,) -> maps [0..K-1] back into [0..N-1]
+        topk_indices = sorted_indices[:, pad_indices]   # (N, K)
+
+        # Candidate mask: valid = first min(N-1, K) columns (self excluded)
+        candidate_mask = (k_range.unsqueeze(0) < (N_total - 1)).expand(N_total, k)  # (N, K)
+
+        return topk_indices, candidate_mask
+
     def _get_topk_neighbors_scene(self, translation, scene_ids, k):
-        """Multi-scene KNN calculating N_s x N_s per scene to avoid N_total^2 VRAM blowup."""
+        """Multi-scene KNN: delegates to _get_topk_neighbors_single per scene."""
         N_total = translation.shape[0]
         device = translation.device
         topk_indices = torch.zeros((N_total, k), dtype=torch.long, device=device)
@@ -339,27 +369,14 @@ class PurelyRelationalPeeler(nn.Module):
 
         for s in unique_scenes:
             idx = (scene_ids == s).nonzero(as_tuple=True)[0]
-            N_s = len(idx)
             t_s = translation[idx]
 
-            diff = t_s.unsqueeze(0) - t_s.unsqueeze(1)
-            dist = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+            # Delegate to single-scene function (keeps both paths aligned)
+            local_topk, mask_s = self._get_topk_neighbors_single(t_s, k)
 
-            K_eff = min(k, N_s)
-
-            topk_dist_s, topk_local = torch.topk(-dist, K_eff, dim=-1)
-            global_topk = idx[topk_local]
-            valid_k = torch.ones((N_s, K_eff), dtype=torch.bool, device=device)
-
-            if K_eff < k:
-                pad_len = k - K_eff
-                pad_indices = idx[0].expand(N_s, pad_len)
-                global_topk = torch.cat([global_topk, pad_indices], dim=1)
-                pad_mask = torch.zeros((N_s, pad_len), dtype=torch.bool, device=device)
-                valid_k = torch.cat([valid_k, pad_mask], dim=1)
-
-            topk_indices[idx] = global_topk
-            candidate_mask[idx] = valid_k
+            # Map local indices back to global indices
+            topk_indices[idx] = idx[local_topk]
+            candidate_mask[idx] = mask_s
 
         return topk_indices, candidate_mask
 
