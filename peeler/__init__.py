@@ -1,16 +1,16 @@
-"""Peeler - Purely relational sparse architecture for fragment clustering.
+"""Peeler - Purely relational sparse architecture with Top-K sigmoid + focal BCE.
 
 Submodules:
     model: PurelyRelationalPeeler
     dataset: PeelerDataset
-    loss: ClusterFocalPeelerLoss
+    loss: SparseFocalBCELoss
 """
 from peeler.model import PurelyRelationalPeeler
 from peeler.dataset import PeelerDataset
-from peeler.loss import ClusterFocalPeelerLoss
+from peeler.loss import SparseFocalBCELoss
 
 __all__ = [
     'PurelyRelationalPeeler',
     'PeelerDataset',
-    'ClusterFocalPeelerLoss',
+    'SparseFocalBCELoss',
 ]

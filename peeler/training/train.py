@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from ..loss import SparseFocalBCELoss
 from .utils import save_checkpoint
 from .validate import FRAGMENT_RANGES, validate
 
@@ -77,6 +78,7 @@ def peeler_train(
     grad_accum_steps = cfg.get('grad_accum_steps', 1)
     max_batches = cfg.get('validation', {}).get('max_batches')
     num_epochs = cfg.get('num_epochs', 200)
+    ari_topk = cfg.get('evaluation', {}).get('ari_topk', 1)
 
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
@@ -89,6 +91,7 @@ def peeler_train(
         best_metric=best_metric,
         grad_accum_steps=grad_accum_steps,
         max_batches=max_batches,
+        ari_topk=ari_topk,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -129,6 +132,7 @@ def _train(
     grad_accum_steps=1,
     max_batches=None,
     num_epochs=200,
+    ari_topk=1,
 ):
     """Run the training epoch loop with cosine annealing LR schedule."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
@@ -156,7 +160,6 @@ def _train(
             transforms = batch['transforms'].to(device, dtype=dtype, non_blocking=True)
             asset_ids = batch['asset_ids'].to(device, dtype=torch.long, non_blocking=True)
             scene_ids = batch['scene_ids'].to(device, non_blocking=True)
-            mask = batch['mask'].to(device, dtype=torch.float32, non_blocking=True)
 
             is_accum_start = batch_idx % effective_grad_accum == 0
             if is_accum_start:
@@ -164,8 +167,8 @@ def _train(
                 step_loss_accum = 0.0
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.bfloat16):
-                scene_logits = model(embeddings, transforms, scene_ids, mask)
-                loss, loss_dict = criterion(scene_logits, asset_ids, scene_ids, mask)
+                logits, indices, candidate_mask = model(embeddings, transforms, scene_ids)
+                loss, loss_dict = criterion(logits, indices, asset_ids, candidate_mask)
 
             step_loss_accum += loss.item()
 
@@ -232,30 +235,24 @@ def _train(
         # Validation every epoch
         val_loss = -1
         val_ari = 0.0
-        val_f1 = 0.0
         val_ari_thres = 0.0
-        val_f1_thres = 0.0
         val_bucket_metrics = {}
         if val_loader is not None:
             val_results = validate(
-                model, val_loader, criterion, device
+                model, val_loader, criterion, device, ari_topk=ari_topk
             )
             val_loss = val_results['avg_loss']
             val_ari = val_results['best_ari']
-            val_f1 = val_results['best_f1']
             val_ari_thres = val_results['best_ari_threshold']
-            val_f1_thres = val_results['best_f1_threshold']
             val_bucket_metrics = val_results.get('bucket_metrics', {})
 
         # Training set validation
         train_results = validate(
-            model, train_loader, criterion, device, max_batches=max_batches
+            model, train_loader, criterion, device, max_batches=max_batches, ari_topk=ari_topk
         )
         train_loss = train_results['avg_loss']
         train_ari = train_results['best_ari']
-        train_f1 = train_results['best_f1']
         train_ari_thres = train_results['best_ari_threshold']
-        train_f1_thres = train_results['best_f1_threshold']
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
@@ -277,8 +274,8 @@ def _train(
 
             # Overall metrics line
             log_msg = f'Epoch {epoch}/{num_epochs} | LR: {lr:.2e} | Loss: {avg_loss:.4f}\n'
-            log_msg += f'  Val: Loss={val_loss:.3f} ARI={val_ari:.3f} F1={val_f1:.3f} (ARI@{val_ari_thres:.2f} F1@{val_f1_thres:.2f})\n'
-            log_msg += f'  Trn: Loss={train_loss:.3f} ARI={train_ari:.3f} F1={train_f1:.3f} (ARI@{train_ari_thres:.2f} F1@{train_f1_thres:.2f})'
+            log_msg += f'  Val: Loss={val_loss:.3f} ARI={val_ari:.3f} (ARI@{val_ari_thres:.2f})\n'
+            log_msg += f'  Trn: Loss={train_loss:.3f} ARI={train_ari:.3f} (ARI@{train_ari_thres:.2f})'
 
             # Bucket metrics - side by side val/train, one per line
             all_buckets = []
@@ -295,9 +292,9 @@ def _train(
                 for range_key, v_bm, t_bm in all_buckets:
                     parts = [f'    Frag {range_key:>7} (n={v_bm["count"] if v_bm else t_bm["count"]:>4}):']
                     if v_bm:
-                        parts.append(f'V ARI={v_bm["ari"]:.3f} F1={v_bm["f1"]:.3f}')
+                        parts.append(f'V ARI={v_bm["ari"]:.3f}')
                     if t_bm:
-                        parts.append(f'T ARI={t_bm["ari"]:.3f} F1={t_bm["f1"]:.3f}')
+                        parts.append(f'T ARI={t_bm["ari"]:.3f}')
                     log_msg += ' ' + '  '.join(parts) + '\n'
 
             epoch_callback(log_msg.rstrip())

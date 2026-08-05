@@ -1,12 +1,12 @@
-"""Peeler - Purely relational sparse architecture for fragment clustering.
+"""Peeler - Purely relational sparse architecture with Top-K competition.
 
 Architecture:
     PurelyRelationalBlock: bottleneck triangular update with fixed highway (N x K sparse)
     RelationalAttentionBlock: sparse local attention (N x K sparse)
-    PurelyRelationalPeeler: affinity logits output for BCE training
+    PurelyRelationalPeeler: sparse Top-K competition logits for softmax CE training
 
-Training: BCE loss on same-asset affinity matrix. Multi-scene batched via scene_ids.
-Inference: Single scene (N, 256) x (N, 16) -> (N, N) logits. ONNX exportable.
+Training: Cross-entropy over K candidates per node. Multi-scene batched via scene_ids.
+Inference: Single scene (N, 256) x (N, 16) -> (N, K) logits + (N, K) indices. ONNX exportable.
 
 Registered with openpoints MODELS registry.
 """
@@ -46,7 +46,7 @@ class StableRMSNorm(nn.Module):
         return x_normed
 
 
-def transforms_to_pose(transforms, mask):
+def transforms_to_pose(transforms):
     """Extract translation, scale, and normalized rotation from 4x4 transforms."""
     N = transforms.shape[0]
     mat = transforms.view(N, 4, 4)
@@ -55,22 +55,21 @@ def transforms_to_pose(transforms, mask):
     scale = scale + 1e-8
     rot = mat[:, :3, :3].reshape(N, -1) / scale
 
-    active_translation = translation * mask.unsqueeze(-1)
-    return active_translation, scale, rot
+    return translation, scale, rot
 
 
-def compute_relative_features(seed_T, seed_S, cand_T, cand_S, seed_rot, cand_rot, topk_indices):
+def compute_relative_features(T, S, R, topk_indices):
     """Compute sparse relative features between seed and top-K candidate poses."""
-    N = seed_T.shape[0]
+    N = T.shape[0]
     K = topk_indices.shape[-1]
 
-    seed_T_flat = seed_T.unsqueeze(1)
-    seed_S_flat = seed_S.unsqueeze(1)
-    seed_rot_flat = seed_rot.unsqueeze(1)
+    seed_T_flat = T.unsqueeze(1)
+    seed_S_flat = S.unsqueeze(1)
+    seed_rot_flat = R.unsqueeze(1)
 
-    cand_T_flat = cand_T[topk_indices, :]
-    cand_S_flat = cand_S[topk_indices]
-    cand_rot_flat = cand_rot[topk_indices, :]
+    cand_T_flat = T[topk_indices, :]
+    cand_S_flat = S[topk_indices]
+    cand_rot_flat = R[topk_indices, :]
 
     diff = cand_T_flat - seed_T_flat
     dist_raw = torch.sqrt(diff.square().sum(-1, keepdim=True) + 1e-8)
@@ -226,31 +225,18 @@ class MLPBlock(nn.Module):
         return e + self.res_scale * result
 
 
-class Symmetrizer(nn.Module):
-    def __init__(self, input_dim, target_dim):
-        super().__init__()
-        self.scaler = nn.Linear(input_dim, target_dim)
-
-    def forward(self, e):
-        e = self.scaler(e)
-        e_T = e.transpose(1, 2)
-        h_sum = e + e_T
-        h_diff = torch.abs(e - e_T)
-        h_prod = e * e_T
-        return torch.cat([h_sum, h_diff, h_prod], dim=-1)
-
-
 _PAIRWISE_DIM = 128
 
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
-    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, attn_dropout=0.0, output_dropout=0.0, top_k=32, **kwargs):
+    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, attn_dropout=0.0, output_dropout=0.0, top_k=32, temperature=0.1, **kwargs):
         super().__init__()
         self.downsample_schedule = list(downsample_schedule)
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.top_k = top_k
+        self.temperature = temperature
 
         self.pairwise_head = nn.Sequential(
             nn.Linear(512, 512),
@@ -293,93 +279,33 @@ class PurelyRelationalPeeler(nn.Module):
         self.output_head = nn.Sequential(
             StableRMSNorm(highway_dim),
             nn.Dropout(output_dropout),
-            # Symmetrizer(highway_dim, highway_dim),
             nn.Linear(highway_dim, highway_dim),
             nn.GELU(),
             nn.Linear(highway_dim, 1)
         )
 
-    def forward(self, embeddings, transforms, scene_ids=None, mask=None):
+    def forward(self, embeddings, transforms, scene_ids=None):
         """Forward pass.
 
-        Single scene / ONNX: scene_ids=None
-            Input: (N, 256), (N, 16) -> Output: (N, N) logits matrix
-
-        Multi-scene training: scene_ids provided
-            Input: (N_total, 256), (N_total, 16), (N_total,), (N_total,)
-            Output: Dict[int, (N_s, N_s)] logits matrices
+        Single scene or multi-scene: scene_ids optional
+            Input: (N_total, 256), (N_total, 16), [(N_total,)] scene_ids
+            Output: (N_total, K) logits, (N_total, K) topk_indices, (N_total, K) candidate_mask
         """
         N_total = embeddings.shape[0]
         K = self.top_k
 
-        if mask is None:
-            mask = torch.ones(N_total, device=embeddings.device, dtype=torch.float32)
-
-        # =========================================================================
-        # PATH A: Single Scene / ONNX Inference Path (100% Loop-Free, Pure Tensor Graph)
-        # =========================================================================
+        # Unified path: always use _get_topk_neighbors_scene for memory-efficient KNN
         if scene_ids is None:
-            translation, scale, rot = transforms_to_pose(transforms, mask)
+            scene_ids = torch.zeros(N_total, dtype=torch.long, device=embeddings.device)
 
-            # 1. Direct N x N Distance Matrix
-            diff = translation.unsqueeze(0) - translation.unsqueeze(1)  # (N, N, 3)
-            dist = torch.sqrt((diff ** 2).sum(-1) + 1e-8)               # (N, N)
-
-            valid_pairs = (mask.unsqueeze(0) > 0) & (mask.unsqueeze(1) > 0)
-            dist = torch.where(valid_pairs, dist, torch.tensor(1e6, device=transforms.device, dtype=dist.dtype))
-
-            # 2. Always pad K columns so TopK graph is consistent for any N
-            dist = F.pad(dist, (0, K), value=1e6)
-
-            topk_dist, topk_indices = torch.topk(-dist, K, dim=-1)  # (N, K)
-            topk_indices = torch.clamp(topk_indices, 0, N_total - 1)
-            candidate_mask = (topk_dist > -1e5) & (mask.unsqueeze(1) > 0)
-
-            # 3. Sparse Features
-            rel_feats = compute_relative_features(
-                translation, scale.squeeze(-1),
-                translation, scale.squeeze(-1),
-                rot, rot, topk_indices
-            )
-
-            norm_emb = torch.clamp(embeddings / 6, max=2, min=-2)
-            emb_neighbors = norm_emb[topk_indices, :]
-            emb_self = norm_emb.unsqueeze(1)
-
-            pairwise_feats = self.pairwise_head(
-                torch.cat([torch.abs(emb_self - emb_neighbors), emb_self * emb_neighbors], dim=-1)
-            )
-            rel_feats = self.rel_head(rel_feats)
-
-            # 4. Highway Stack
-            e = self.input_proj(torch.cat([rel_feats, pairwise_feats], dim=-1))  # (N, K, D)
-            for block in self.blocks:
-                if isinstance(block, PurelyRelationalBlock):
-                    e = block(e, candidate_mask, topk_indices=topk_indices)
-                else:
-                    e = block(e, candidate_mask)
-
-            # 5. Zero-Copy Scatter & Symmetrization
-            D = e.shape[-1]
-            e_dense = torch.zeros(N_total, N_total, D, device=e.device, dtype=e.dtype)
-            topk_exp = topk_indices.unsqueeze(-1).expand(-1, -1, D)
-            e_dense.scatter_(1, topk_exp, e)
-
-            logits = self.output_head(e_dense.unsqueeze(0)).squeeze(0).squeeze(-1)  # (N, N)
-            return logits
-
-        # =========================================================================
-        # PATH B: Multi-Scene Training Path (Memory-Efficient Sum(N_s^2) Batching)
-        # =========================================================================
-        translation, scale, rot = transforms_to_pose(transforms, mask)
+        translation, scale, rot = transforms_to_pose(transforms)
         topk_indices, candidate_mask = self._get_topk_neighbors_scene(
-            translation, scene_ids, mask, K
+            translation, scene_ids, K
         )
 
         rel_feats = compute_relative_features(
             translation, scale.squeeze(-1),
-            translation, scale.squeeze(-1),
-            rot, rot, topk_indices
+            rot, topk_indices
         )
 
         norm_emb = torch.clamp(embeddings / 6, max=2, min=-2)
@@ -399,15 +325,10 @@ class PurelyRelationalPeeler(nn.Module):
             else:
                 e = block(e, candidate_mask)
 
-        unique = torch.unique(scene_ids)
-        results = {}
-        for s in unique:
-            idx = (scene_ids == s).nonzero(as_tuple=True)[0]
-            results[int(s.item())] = self._scatter_and_output(idx, e, topk_indices, mask)
+        logits = self.output_head(e).squeeze(-1)  # (N_total, K)
+        return logits, topk_indices, candidate_mask
 
-        return results
-
-    def _get_topk_neighbors_scene(self, translation, scene_ids, mask, k):
+    def _get_topk_neighbors_scene(self, translation, scene_ids, k):
         """Multi-scene KNN calculating N_s x N_s per scene to avoid N_total^2 VRAM blowup."""
         N_total = translation.shape[0]
         device = translation.device
@@ -420,19 +341,15 @@ class PurelyRelationalPeeler(nn.Module):
             idx = (scene_ids == s).nonzero(as_tuple=True)[0]
             N_s = len(idx)
             t_s = translation[idx]
-            m_s = mask[idx]
 
             diff = t_s.unsqueeze(0) - t_s.unsqueeze(1)
             dist = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
-
-            valid_pairs = (m_s.unsqueeze(0) > 0) & (m_s.unsqueeze(1) > 0)
-            dist = torch.where(valid_pairs, dist, torch.tensor(1e6, device=device, dtype=dist.dtype))
 
             K_eff = min(k, N_s)
 
             topk_dist_s, topk_local = torch.topk(-dist, K_eff, dim=-1)
             global_topk = idx[topk_local]
-            valid_k = (topk_dist_s > -1e5) & (m_s.unsqueeze(1) > 0)
+            valid_k = torch.ones((N_s, K_eff), dtype=torch.bool, device=device)
 
             if K_eff < k:
                 pad_len = k - K_eff
@@ -446,18 +363,4 @@ class PurelyRelationalPeeler(nn.Module):
 
         return topk_indices, candidate_mask
 
-    def _scatter_and_output(self, idx, e, topk_indices, mask):
-        """Scatter (N_s, K, D) -> (N_s, N_s, D) for multi-scene loss."""
-        N_s = len(idx)
-        e_s = e[idx]
-        topk_s = topk_indices[idx]
 
-        topk_local = torch.clamp(torch.searchsorted(idx, topk_s), 0, N_s - 1)
-
-        D = e_s.shape[-1]
-        e_dense = torch.zeros(N_s, N_s, D, device=e.device, dtype=e.dtype)
-        topk_local_exp = topk_local.unsqueeze(-1).expand(-1, -1, D)
-        e_dense.scatter_(1, topk_local_exp, e_s)
-
-        e_dense = e_dense.unsqueeze(0)
-        return self.output_head(e_dense).squeeze(0).squeeze(-1)

@@ -1,14 +1,14 @@
 batch_size: 32
 criterion:
-  NAME: ClusterFocalPeelerLoss
+  NAME: SparseFocalBCELoss
+  alpha: 0.5
   gamma: 2.0
-  neg_weight: 0.5
-  pos_weight: 0.5
-  transitivity_weight: 0.0
 dataset:
   max_fragments: 600
   seed: 42
 eta_min: 1.0e-05
+evaluation:
+  ari_topk: 16
 grad_accum_steps: 1
 lr: 0.001
 lr_pct_start: 0.1
@@ -32,11 +32,12 @@ model:
   - 128
   output_dropout: 0.0
   pairwise_dropout: 0.0
+  temperature: 0.1
   top_k: 32
 num_epochs: 200
 optimizer:
   NAME: adamw
-  weight_decay: 0.05
+  weight_decay: 0.1
 training:
   device: cuda
   ema_alpha: 0.0

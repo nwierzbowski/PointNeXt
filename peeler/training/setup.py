@@ -127,10 +127,9 @@ def setup(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=1,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=3,
         collate_fn=train_dataset.collate_fn,
     )
     if log_callback:
@@ -146,10 +145,9 @@ def setup(
             val_dataset,
             batch_size=cfg.validation.get('batch_size', 1),
             shuffle=False,
-            num_workers=2,
+            num_workers=1,
             pin_memory=True,
             drop_last=False,
-            prefetch_factor=3,
             collate_fn=val_dataset.collate_fn,
         )
         if log_callback:
