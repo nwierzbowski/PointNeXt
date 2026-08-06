@@ -40,6 +40,9 @@ def build_peeler_dataset(cfg, all_embeddings, all_transforms, asset_to_file=None
         asset_to_file=asset_to_file,
         max_fragments=dataset_cfg.get('max_fragments', 700),
         seed=dataset_cfg.get('seed', 42),
+        asset_dropout_prob=dataset_cfg.get('asset_dropout_prob', 0.0),
+        burst_prob=dataset_cfg.get('burst_prob', 0.5),
+        asset_swap_prob=dataset_cfg.get('asset_swap_prob', 0.0),
     )
     return dataset
 
@@ -114,11 +117,11 @@ def setup(
     if log_callback:
         log_callback(f'Device: {device}')
 
-    batch_size = cfg.batch_size
-    num_epochs = cfg.get('num_epochs', 200)
-    lr_pct_start = cfg.get('lr_pct_start', 0.1)
-    eta_min = cfg.get('eta_min', 1e-5)
-    grad_accum_steps = cfg.get('grad_accum_steps', 1)
+    batch_size = cfg.training.batch_size
+    num_epochs = cfg.training.get('num_epochs', 200)
+    lr_pct_start = cfg.training.get('lr_pct_start', 0.1)
+    eta_min = cfg.training.get('eta_min', 1e-5)
+    grad_accum_steps = cfg.training.get('grad_accum_steps', 1)
     warmup_epochs = max(1, int(num_epochs * lr_pct_start))
 
     # Build train dataset
@@ -185,9 +188,9 @@ def setup(
     ]
 
     if optimizer_cfg.NAME == 'adamw':
-        optimizer = torch.optim.AdamW(param_groups, lr=cfg.lr)
+        optimizer = torch.optim.AdamW(param_groups, lr=cfg.training.lr)
     elif optimizer_cfg.NAME == 'adam':
-        optimizer = torch.optim.Adam(param_groups, lr=cfg.lr)
+        optimizer = torch.optim.Adam(param_groups, lr=cfg.training.lr)
     else:
         raise ValueError(f'Unknown optimizer: {optimizer_cfg.NAME}')
 

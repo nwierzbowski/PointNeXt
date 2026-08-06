@@ -244,7 +244,7 @@ def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1)
     total_samples = 0
     valid_sample_count_ari = 0
 
-    thresholds_np = np.arange(0.0, 1.0, 0.01)
+    thresholds_np = np.arange(0.2, 0.8, 0.02)
     num_thresholds = len(thresholds_np)
     ari_sums = np.zeros(num_thresholds, dtype=np.float64)
 

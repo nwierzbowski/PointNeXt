@@ -75,9 +75,9 @@ def peeler_train(
     best_metric = 'ari'
 
     # 4. Internal train() — called with all config loaded
-    grad_accum_steps = cfg.get('grad_accum_steps', 1)
+    grad_accum_steps = cfg.get('training', {}).get('grad_accum_steps', 1)
     max_batches = cfg.get('validation', {}).get('max_batches')
-    num_epochs = cfg.get('num_epochs', 200)
+    num_epochs = cfg.get('training', {}).get('num_epochs', 200)
     ari_topk = cfg.get('evaluation', {}).get('ari_topk', 1)
 
     return _train(

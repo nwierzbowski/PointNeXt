@@ -46,7 +46,7 @@ class SparseFocalBCELoss(nn.Module):
         # Vectorized label generation using global indices
         seed_assets = asset_ids.unsqueeze(-1)  # (N, 1)
         cand_assets = asset_ids[indices]       # (N, K)
-        labels = (seed_assets == cand_assets).float()  # (N, K)
+        labels = (seed_assets == cand_assets).float() * 0.9 + 0.05  # (N, K)
 
         # Sigmoid probabilities
         probs = torch.sigmoid(logits)

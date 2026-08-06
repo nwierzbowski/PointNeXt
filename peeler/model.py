@@ -230,13 +230,12 @@ _PAIRWISE_DIM = 128
 
 @MODELS.register_module()
 class PurelyRelationalPeeler(nn.Module):
-    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, attn_dropout=0.0, output_dropout=0.0, top_k=32, temperature=0.1, **kwargs):
+    def __init__(self, downsample_schedule, mlp_sizes, highway_dim, pairwise_dropout, attn_dropout=0.0, output_dropout=0.0, top_k=32, **kwargs):
         super().__init__()
         self.downsample_schedule = list(downsample_schedule)
         self.num_blocks = len(self.downsample_schedule)
         self.mlp_sizes = list(mlp_sizes)
         self.top_k = top_k
-        self.temperature = temperature
 
         self.pairwise_head = nn.Sequential(
             nn.Linear(512, 512),

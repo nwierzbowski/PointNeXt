@@ -17,7 +17,8 @@ from torch.utils.data import Dataset
 
 from openpoints.dataset.build import DATASETS
 from .training.validate import FRAGMENT_RANGES
-from .scene_joiner import ROTATION_COLS, TRANSLATION_COLS, SceneJoiner
+from .scene_joiner import SceneJoiner, compute_asset_scale, compute_asset_centroid, TRANSLATION_COLS
+from .scene_splitter import SceneSplitter
 
 # Pool building config
 SAMPLES_PER_EPOCH = 2000
@@ -53,12 +54,9 @@ class PeelerDataset(Dataset):
         asset_to_file: list mapping asset_idx -> scene_idx (scene = TBO file)
         max_fragments: int, maximum total fragments per soup
         seed: int, random seed for reproducibility
-        embedding_noise_sigma: float, std dev of Gaussian noise added to embeddings (0 = disabled)
-        translation_noise_sigma: float, std dev of per-fragment Gaussian noise on translation columns (0 = disabled)
-        scaling_noise_sigma: float, std dev of per-fragment Gaussian noise on rotation/scale block (0 = disabled)
-        per_asset_rotation: bool, apply uniform random SO(3) rotation to each asset's fragments
-        per_asset_translation_sigma: float, std dev of per-asset translation offset (0 = disabled)
-        per_asset_scale_sigma: float, std dev of per-asset isotropic scale noise (0 = disabled)
+        asset_dropout_prob: float, probability of triggering an asset dropout burst (0 = disabled, only effective in train mode)
+        burst_prob: float, binomial p for burst size (default 0.5, burst=1 is 50%, burst=2 is 25%, etc.)
+        asset_swap_prob: float, probability of swapping an asset's embedding with one of equal fragment count (0 = disabled)
     """
 
     def __init__(
@@ -69,6 +67,9 @@ class PeelerDataset(Dataset):
         asset_to_file,
         max_fragments,
         seed,
+        asset_dropout_prob=0.0,
+        burst_prob=0.5,
+        asset_swap_prob=0.0,
     ):
         assert mode in ('train', 'val'), f"Invalid mode: {mode}"
         self.mode = mode
@@ -77,7 +78,15 @@ class PeelerDataset(Dataset):
         self.asset_to_file = asset_to_file  # list of int: asset_idx -> scene_idx
         self.max_fragments = max_fragments
         self.seed = seed
+        self.asset_dropout_prob = asset_dropout_prob
+        self.burst_prob = burst_prob
+        self.asset_swap_prob = asset_swap_prob
         self._epoch = 0
+
+        # Fragment count buckets: fragment_count -> [asset_indices]
+        self._fragment_buckets = defaultdict(list)
+        for asset_idx, emb in enumerate(all_embeddings):
+            self._fragment_buckets[len(emb)].append(asset_idx)
 
         # Group asset indices by scene
         self._scene_assets = defaultdict(list)
@@ -92,7 +101,6 @@ class PeelerDataset(Dataset):
         # Join tracking (training only)
         self._scene_is_joined = {}
         self._scene_sources = {}
-        self._scene_join_transforms = {}
 
         # Bucket scene counts (for capping)
         self._bucket_counts = Counter()
@@ -112,11 +120,22 @@ class PeelerDataset(Dataset):
 
         # Split scenes into sub-scenes for smaller buckets (training only)
         if mode == 'train':
-            self._split_scenes()
+            SceneSplitter(self._scene_assets, self._scene_is_sub,
+                          self._scene_parent, self._scene_bucket,
+                          self._bucket_scenes, self._bucket_counts,
+                          self.all_embeddings, self.max_fragments, mode).run()
 
         # Join small scenes into larger scenes for bigger buckets (training only)
         if mode == 'train':
-            self._join_scenes()
+            SceneJoiner(self.all_transforms, [bk for _, bk in FRAGMENT_RANGES],
+                        self.all_embeddings,
+                        scene_assets=self._scene_assets,
+                        scene_is_joined=self._scene_is_joined,
+                        scene_sources=self._scene_sources,
+                        scene_bucket=self._scene_bucket,
+                        bucket_scenes=self._bucket_scenes,
+                        bucket_counts=self._bucket_counts,
+                        scene_is_sub=self._scene_is_sub).run(self.max_fragments)
 
         # Sorted list of all scenes (original + sub-scenes + joined)
         self._sorted_scenes = sorted(self._scene_assets.keys())
@@ -152,147 +171,6 @@ class PeelerDataset(Dataset):
         lines.append(f'  {"TOTAL":>8}: {total_raw:>5} raw + {total_split:>5} split + {total_join:>5} join = {total_all:>5} total')
         return '\n'.join(lines)
 
-    def _split_scenes(self):
-        """Split each scene into sub-scenes for every bucket below its own.
-        
-        Walks through FRAGMENT_RANGES from smallest to largest. For each bucket,
-        greedily accumulates consecutive assets (Morton order) that fit within
-        the bucket's fragment range. With replacement: each bucket gets an
-        independent pass through all assets. Stops when bucket reaches MAX_BUCKET_SIZE scenes.
-        """
-        next_idx = max(self._scene_assets.keys()) + 1 if self._scene_assets else 0
-
-        for scene_idx in list(self._scene_assets.keys()):
-            assets = self._scene_assets[scene_idx]
-            frag_counts = [len(self.all_embeddings[a]) for a in assets]
-            total_frags = sum(frag_counts)
-            scene_bucket = _frag_to_range_key(total_frags)
-
-            for (low, high), bucket_key in FRAGMENT_RANGES:
-                if bucket_key == '1' or bucket_key == scene_bucket:
-                    continue
-
-                sub_asset_lists = self._split_scene(assets, frag_counts, low, high)
-                for asset_indices in sub_asset_lists:
-                    if self._bucket_counts[bucket_key] >= MAX_BUCKET_SIZE:
-                        continue
-                    self._scene_assets[next_idx] = asset_indices
-                    self._scene_is_sub[next_idx] = True
-                    self._scene_parent[next_idx] = scene_idx
-                    self._scene_bucket[next_idx] = bucket_key
-                    self._bucket_scenes[bucket_key].append(next_idx)
-                    self._bucket_counts[bucket_key] += 1
-                    next_idx += 1
-
-
-
-    def _split_scene(self, assets, frag_counts, bucket_lower, bucket_upper):
-        """Split a scene into sub-scenes for a given bucket range.
-        
-        Greedily accumulates consecutive assets starting from each position.
-        Returns list of asset index lists, each fitting within [bucket_lower, bucket_upper].
-        """
-        n = len(assets)
-        sub_scenes = []
-        i = 0
-
-        while i < n:
-            fi = frag_counts[i]
-
-            if fi >= bucket_upper:
-                # Too big (or at upper bound, exclusive), skip this asset
-                i += 1
-                continue
-
-            # Greedily accumulate consecutive assets while total < bucket_upper
-            total = fi
-            j = i + 1
-            while j < n and total + frag_counts[j] < bucket_upper:
-                total += frag_counts[j]
-                j += 1
-
-            # Add as sub-scene if accumulated total fits in bucket range [bucket_lower, bucket_upper)
-            if total >= bucket_lower and total < bucket_upper:
-                sub_scenes.append([assets[k] for k in range(i, j)])
-
-            i = j
-
-        return sub_scenes
-
-    def _join_scenes(self):
-        """Join small scenes into larger scenes for bigger buckets.
-        
-        Walks through FRAGMENT_RANGES from smallest to largest. For each bucket,
-        collects original (non-sub) scenes from strictly smaller buckets, shuffles
-        them, and greedily accumulates into groups that fit the target bucket range.
-        Each group becomes a new joined scene entry.
-        """
-        joiner = SceneJoiner(self.all_transforms, [bk for _, bk in FRAGMENT_RANGES])
-        next_idx = max(self._scene_assets.keys()) + 1
-
-        for bucket_idx, (bucket_range, bucket_key) in enumerate(FRAGMENT_RANGES):
-            bucket_lower, bucket_upper = bucket_range
-            # Use max_fragments as upper bound for the '300+' bucket
-            if bucket_key == '300+':
-                bucket_upper = self.max_fragments
-
-            # Collect original (non-sub, non-joined) scenes from strictly smaller FRAGMENT_RANGES buckets
-            available = []
-            for smaller_idx in range(bucket_idx):
-                _, smaller_key = FRAGMENT_RANGES[smaller_idx]
-                for scene_idx in self._bucket_scenes.get(smaller_key, []):
-                    if scene_idx not in self._scene_is_sub and scene_idx not in self._scene_is_joined:
-                        available.append(scene_idx)
-
-            if len(available) < 2:
-                continue
-
-            # Select groups of scenes to join
-            groups = joiner.select_scenes_for_bucket(
-                available, self._scene_assets,
-                self.all_embeddings, bucket_lower, bucket_upper,
-            )
-
-            for group in groups:
-                if len(group) < 2:
-                    continue
-                if self._bucket_counts[bucket_key] >= MAX_BUCKET_SIZE:
-                    continue
-
-                # Compute transforms and pack
-                join_transforms = joiner.compute_join_transforms(group, self._scene_assets)
-                sources = list(join_transforms.keys())
-                radii = [join_transforms[s]['bounding_radius'] for s in sources]
-                positions = joiner.pack_scenes(sources, radii)
-
-                # Build position map: scene_idx -> (pack_x, pack_z)
-                pos_map = dict(zip(sources, positions))
-
-                # Create joined scene entry
-                joined_assets = []
-                for src in group:
-                    joined_assets.extend(self._scene_assets[src])
-
-                self._scene_assets[next_idx] = joined_assets
-                self._scene_is_joined[next_idx] = True
-                self._scene_sources[next_idx] = group
-
-                # Store join transforms with packing positions
-                self._scene_join_transforms[next_idx] = {}
-                for src in group:
-                    t = join_transforms[src].copy()
-                    t['asset_norm_factors'] = dict(t['asset_norm_factors'])
-                    t['pack_x'] = pos_map[src][0]
-                    t['pack_z'] = pos_map[src][1]
-                    self._scene_join_transforms[next_idx][src] = t
-
-                # Assign joined scene to target bucket
-                self._scene_bucket[next_idx] = bucket_key
-                self._bucket_scenes[bucket_key].append(next_idx)
-                self._bucket_counts[bucket_key] += 1
-
-                next_idx += 1
-
     def _get_scene_bucket(self, scene_idx):
         """Get the bucket key for a scene, computing it if not pre-assigned."""
         if scene_idx in self._scene_bucket:
@@ -300,54 +178,6 @@ class PeelerDataset(Dataset):
         asset_indices = self._scene_assets[scene_idx]
         total_frags = sum(len(self.all_embeddings[a]) for a in asset_indices)
         return _frag_to_range_key(total_frags)
-
-    def _apply_join_transforms(self, soup_trans, chosen_asset_indices, scene_idx):
-        """Apply normalization and packing transforms to a joined scene.
-
-        For each asset in the scene:
-        1. Scale rotation block and position by asset_norm_factor (asset_scale / mean_scale)
-        2. Add packing translation (pack_x, 0, pack_z) to position columns
-
-        Args:
-            soup_trans: (N, 16) transform array, modified in-place
-            chosen_asset_indices: list of asset gids in order (matching soup_trans layout)
-            scene_idx: the joined scene index
-        """
-        join_transforms = self._scene_join_transforms[scene_idx]
-        offset = 0
-
-        for asset_gid in chosen_asset_indices:
-            n_frags = len(self.all_embeddings[asset_gid])
-            # Find which source scene this asset belongs to
-            src_transforms = None
-            for src_idx, src_t in join_transforms.items():
-                if asset_gid in src_t['asset_norm_factors']:
-                    src_transforms = src_t
-                    break
-
-            if src_transforms is None:
-                offset += n_frags
-                continue
-
-            asset_norm_factor = src_transforms['asset_norm_factors'][asset_gid]
-            pack_x = src_transforms['pack_x']
-            pack_z = src_transforms['pack_z']
-
-            if not (0.01 < asset_norm_factor < 100.0):
-                offset += n_frags
-                continue
-
-            if asset_norm_factor != 1.0:
-                # Scale rotation block
-                soup_trans[offset:offset + n_frags, ROTATION_COLS] *= asset_norm_factor
-                # Scale position
-                soup_trans[offset:offset + n_frags, TRANSLATION_COLS] *= asset_norm_factor
-
-            # Apply packing translation (only to position, not rotation)
-            soup_trans[offset:offset + n_frags, 3] += pack_x
-            soup_trans[offset:offset + n_frags, 11] += pack_z
-
-            offset += n_frags
 
     def set_epoch(self, epoch: int):
         """Set the epoch and build a uniform pool across all buckets.
@@ -396,29 +226,85 @@ class PeelerDataset(Dataset):
         # Use all assets from the scene (each contributes all its fragments)
         chosen_asset_indices = sorted(scene_asset_indices)
 
-        # Collect embeddings and transforms from chosen assets
+        # RNG for asset dropout and swap (deterministic per sample)
+        if self.mode == 'train' and (self.asset_dropout_prob > 0 or self.asset_swap_prob > 0):
+            dropout_rng = np.random.RandomState(self.seed + idx + self._epoch * 100000)
+
+        # Collect embeddings and transforms from chosen assets with burst dropout and swap
         soup_emb_list = []
         soup_trans_list = []
         asset_ids_list = []
         asset_fragments = []
 
-        for local_asset_id, asset_gid in enumerate(chosen_asset_indices):
+        new_local_id = 0
+        i = 0
+        while i < len(chosen_asset_indices):
+            asset_gid = chosen_asset_indices[i]
+
+            # Burst dropout (training only): check if this asset triggers a dropout burst
+            if self.mode == 'train' and self.asset_dropout_prob > 0:
+                if dropout_rng.random() < self.asset_dropout_prob:
+                    # Roll burst size: geometric distribution (burst=0 is 50%, burst=1 is 25%, etc.)
+                    burst_size = dropout_rng.geometric(p=self.burst_prob)
+                    # Skip this asset + burst_size additional consecutive assets
+                    i += 1 + burst_size
+                    continue
+
             emb = self.all_embeddings[asset_gid]
             trans = self.all_transforms[asset_gid]
             n_fragments = len(emb)
 
+            # Asset swap (training only): replace embedding and normalize transform to original's space
+            if self.mode == 'train' and self.asset_swap_prob > 0:
+                if dropout_rng.random() < self.asset_swap_prob:
+                    bucket = self._fragment_buckets.get(n_fragments)
+                    if bucket and len(bucket) > 1:
+                        replacement_gid = bucket[dropout_rng.randint(0, len(bucket))]
+                        emb = self.all_embeddings[replacement_gid]
+
+                        # Compute original and replacement asset's scale and centroid
+                        orig_scale = compute_asset_scale(trans)
+                        orig_centroid = compute_asset_centroid(trans)
+
+                        rep_trans = self.all_transforms[replacement_gid]
+                        rep_scale = compute_asset_scale(rep_trans)
+                        rep_centroid = compute_asset_centroid(rep_trans)
+
+                        # Normalize replacement to canonical space, apply original's transform
+                        if rep_scale > 1e-6:
+                            new_trans = trans.copy()
+                            # Normalize translation, apply original's scale and centroid
+                            new_trans[:, TRANSLATION_COLS] = (
+                                (rep_trans[:, TRANSLATION_COLS] - rep_centroid) / rep_scale
+                            ) * orig_scale + orig_centroid
+                            # Normalize rotation, apply original's scale
+                            rot_cols = (0, 1, 2, 4, 5, 6, 8, 9, 10)
+                            new_trans[:, rot_cols] = (
+                                rep_trans[:, rot_cols] / rep_scale
+                            ) * orig_scale
+                            trans = new_trans
+
             soup_emb_list.append(emb)
             soup_trans_list.append(trans)
-            asset_ids_list.append(np.full(n_fragments, local_asset_id, dtype=np.int64))
+            asset_ids_list.append(np.full(n_fragments, new_local_id, dtype=np.int64))
             asset_fragments.append(n_fragments)
+            new_local_id += 1
+            i += 1
+
+        # Fallback: if all assets were dropped, use all of them
+        if len(soup_emb_list) == 0:
+            for local_asset_id, asset_gid in enumerate(chosen_asset_indices):
+                emb = self.all_embeddings[asset_gid]
+                trans = self.all_transforms[asset_gid]
+                n_fragments = len(emb)
+                soup_emb_list.append(emb)
+                soup_trans_list.append(trans)
+                asset_ids_list.append(np.full(n_fragments, local_asset_id, dtype=np.int64))
+                asset_fragments.append(n_fragments)
 
         soup_emb = np.concatenate(soup_emb_list, axis=0)
         soup_trans = np.concatenate(soup_trans_list, axis=0)
         asset_ids = np.concatenate(asset_ids_list, axis=0)
-
-        # Apply join transforms for joined scenes (normalize scale + pack on XZ)
-        if scene_idx in self._scene_is_joined and scene_idx in self._scene_join_transforms:
-            self._apply_join_transforms(soup_trans, chosen_asset_indices, scene_idx)
 
         # Truncate to max_fragments if scene is too large
         n = len(soup_emb)
