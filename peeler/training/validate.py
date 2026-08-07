@@ -19,6 +19,8 @@ FRAGMENT_RANGES = [
     ((301, float('inf')), '300+'),
 ]
 
+BUCKET_LABELS = [item[1] for item in FRAGMENT_RANGES]
+
 
 def _frag_to_range_key(frag: int) -> str:
     """Map fragment count to range key string."""
