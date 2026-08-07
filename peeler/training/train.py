@@ -215,7 +215,7 @@ def _train(
                     iters_per_sec = num_batches / elapsed if elapsed > 0 else 0
                     lr = optimizer.param_groups[0]['lr']
                     log_callback(
-                        f'Step {global_step} (epoch {epoch}/{num_epochs}) - '
+                        f'Step {global_step} - '
                         f'Loss: {report_loss / report_interval:.4f} | LR: {lr:.6f} | '
                         f'{iters_per_sec:.1f} it/s'
                     )
