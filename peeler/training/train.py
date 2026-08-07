@@ -332,4 +332,15 @@ def _train(
             else:
                 save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path)
 
+        last_epoch = epoch
+
+    # Save final checkpoint
+    final_ckpt = os.path.join(checkpoint_dir, 'final.pth')
+    if save_checkpoint_callback:
+        save_checkpoint_callback(model, optimizer, last_epoch, val_loss, final_ckpt,
+                                 best_metric=best_metric, best_metric_value=best_metric_value)
+    else:
+        save_checkpoint(model, optimizer, last_epoch, val_loss, final_ckpt,
+                        best_metric=best_metric, best_metric_value=best_metric_value)
+
     return best_metric, best_metric_value, best_epoch

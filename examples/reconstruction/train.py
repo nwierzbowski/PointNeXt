@@ -118,6 +118,12 @@ def train(
             ckpt_path = os.path.join(checkpoint_dir, f'epoch_{epoch}.pth')
             save_checkpoint_callback(model, optimizer, epoch, avg_loss, ckpt_path, scheduler, in_channels)
 
+        last_epoch = epoch
+
+    # Save final checkpoint
+    final_ckpt = os.path.join(checkpoint_dir, 'final.pth')
+    save_checkpoint_callback(model, optimizer, last_epoch, avg_loss, final_ckpt, scheduler, in_channels)
+
     return best_loss
 
 
