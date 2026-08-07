@@ -80,6 +80,7 @@ def peeler_train(
     num_epochs = cfg.get('training', {}).get('num_epochs', 200)
     ari_topk = cfg.get('evaluation', {}).get('ari_topk', 1)
     bucket_topk_map = ari_topk if isinstance(ari_topk, dict) else None
+    edge_mode = cfg.get('evaluation', {}).get('edge_mode', 'raw')
 
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
@@ -94,6 +95,7 @@ def peeler_train(
     max_batches=max_batches,
     ari_topk=ari_topk,
     bucket_topk_map=bucket_topk_map,
+    edge_mode=edge_mode,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -136,6 +138,7 @@ def _train(
     num_epochs=200,
     ari_topk=1,
     bucket_topk_map=None,
+    edge_mode='raw',
 ):
     """Run the training epoch loop with cosine annealing LR schedule."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
@@ -242,7 +245,7 @@ def _train(
         if val_loader is not None:
             val_results = validate(
                 model, val_loader, criterion, device, ari_topk=ari_topk,
-                bucket_topk_map=bucket_topk_map
+                bucket_topk_map=bucket_topk_map, edge_mode=edge_mode
             )
             val_loss = val_results['avg_loss']
             val_bucket_metrics = val_results.get('bucket_metrics', {})
@@ -252,7 +255,7 @@ def _train(
         # Training set validation
         train_results = validate(
             model, train_loader, criterion, device, max_batches=max_batches,
-            ari_topk=ari_topk, bucket_topk_map=bucket_topk_map
+            ari_topk=ari_topk, bucket_topk_map=bucket_topk_map, edge_mode=edge_mode
         )
         train_loss = train_results['avg_loss']
         train_bucket_metrics = train_results.get('bucket_metrics', {})

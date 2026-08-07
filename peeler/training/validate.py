@@ -153,7 +153,7 @@ def _kruskal_ari_sweep_numba(src, tgt, weights, thresholds_desc, n, gt_labels_cl
 # 2. SPARSE KRUSKAL SINGLE-LINKAGE EVALUATOR
 # =============================================================================
 
-def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresholds, topk_eval=1):
+def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresholds, topk_eval=1, edge_mode='raw'):
     """Compute ARI across thresholds using Sparse Kruskal Union-Find.
 
     Args:
@@ -162,6 +162,7 @@ def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresh
         gt_labels_np: (N,) array of ground truth labels
         thresholds: array of threshold values to sweep
         topk_eval: number of top-K edges to use per point (1 = strongest only)
+        edge_mode: 'raw' for directed edges, 'gmean' for reciprocal geometric mean
     """
     N = len(gt_labels_np)
     if N <= 1:
@@ -194,13 +195,16 @@ def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresh
 
     # Filter out self-loops and invalid targets
     valid = (src != tgt) & (tgt >= 0) & (tgt < N)
+    src = src[valid]
+    tgt = tgt[valid]
+    weights = weights[valid]
 
     # Thresholds descending
     desc_t_order = np.argsort(-thresholds)
     thresholds_desc = thresholds[desc_t_order]
     num_t = len(thresholds)
 
-    if not np.any(valid):
+    if len(src) == 0:
         # Baseline ARI when no valid edges exist
         sum_b = 0.0
         expected_index = (sum_a * sum_b) / n_choose_2
@@ -209,15 +213,61 @@ def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresh
         base_ari = (0.0 - expected_index) / denom if denom != 0 else (1.0 if sum_a == sum_b else 0.0)
         return np.full(num_t, base_ari, dtype=np.float64)
 
-    src_v = src[valid]
-    tgt_v = tgt[valid]
-    w_v = weights[valid]
+    if edge_mode in ('gmean', 'avg'):
+        # Build forward lookup for reciprocal edge finding
+        forward = {}
+        for i in range(len(src)):
+            forward[(src[i], tgt[i])] = weights[i]
 
-    # Sort directed edges descending by weight
-    order = np.argsort(-w_v)
-    src_v = src_v[order]
-    tgt_v = tgt_v[order]
-    w_v = w_v[order]
+        # Find reciprocal edges with combined weights
+        reciprocal_src = []
+        reciprocal_tgt = []
+        reciprocal_weights = []
+        seen = set()
+
+        for i in range(len(src)):
+            s, t = src[i], tgt[i]
+            w = weights[i]
+            if (t, s) in forward:
+                canonical = (min(s, t), max(s, t))
+                if canonical not in seen:
+                    seen.add(canonical)
+                    reciprocal_src.append(min(s, t))
+                    reciprocal_tgt.append(max(s, t))
+                    if edge_mode == 'gmean':
+                        reciprocal_weights.append(np.sqrt(w * forward[(t, s)]))
+                    else:  # avg
+                        reciprocal_weights.append((w + forward[(t, s)]) / 2.0)
+
+        if len(reciprocal_src) == 0:
+            # Baseline ARI when no reciprocal edges exist
+            sum_b = 0.0
+            expected_index = (sum_a * sum_b) / n_choose_2
+            max_index = (sum_a + sum_b) / 2.0
+            denom = max_index - expected_index
+            base_ari = (0.0 - expected_index) / denom if denom != 0 else (1.0 if sum_a == sum_b else 0.0)
+            return np.full(num_t, base_ari, dtype=np.float64)
+
+        src_v = np.array(reciprocal_src, dtype=np.int32)
+        tgt_v = np.array(reciprocal_tgt, dtype=np.int32)
+        w_v = np.array(reciprocal_weights, dtype=np.float64)
+
+        # Sort undirected edges descending by weight
+        order = np.argsort(-w_v)
+        src_v = src_v[order]
+        tgt_v = tgt_v[order]
+        w_v = w_v[order]
+    else:
+        # Raw mode: use directed edges as-is
+        src_v = src
+        tgt_v = tgt
+        w_v = weights
+
+        # Sort directed edges descending by weight
+        order = np.argsort(-w_v)
+        src_v = src_v[order]
+        tgt_v = tgt_v[order]
+        w_v = w_v[order]
 
     # Fused C-Kernel Kruskal + ARI sweep
     ari_desc = _kruskal_ari_sweep_numba(
@@ -237,12 +287,13 @@ def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresh
 # 3. MAIN VALIDATION HARNESS
 # =============================================================================
 
-def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1, bucket_topk_map=None):
+def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1, bucket_topk_map=None, edge_mode='raw'):
     """Run validation loop, sweeping thresholds to find best ARI via sparse single-linkage.
     
     Args:
         bucket_topk_map: Optional dict mapping bucket keys to topk values.
-                        If provided, uses per-bucket topk for ARI evaluation.
+                         If provided, uses per-bucket topk for ARI evaluation.
+        edge_mode: Edge weight mode for ARI computation - 'raw' (directed) or 'gmean' (reciprocal geometric mean).
     """
     model.eval()
     total_loss = 0.0
@@ -337,7 +388,7 @@ def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1,
                 topk_eval = bucket_topk_map.get(range_key, ari_topk) if bucket_topk_map else ari_topk
                 b_ari = _eval_single_sample_ari_sparse(
                     probs_s_np, local_indices_np, scene_asset_ids_np,
-                    thresholds_np, topk_eval=topk_eval
+                    thresholds_np, topk_eval=topk_eval, edge_mode=edge_mode
                 )
 
                 track_bucket = range_key is not None and range_key in buckets
