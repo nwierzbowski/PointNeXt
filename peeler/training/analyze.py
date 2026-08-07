@@ -112,11 +112,13 @@ def run_analysis(model, val_loader, topk_values, device, criterion,
         'best_per_bucket': best_per_bucket,
     }
 
-    # Write best topk to config if callback provided
+    # Build evaluation section for apply-to-config
+    evaluation_topk = {}
+    for bucket_key, entry in best_per_bucket.items():
+        evaluation_topk[bucket_key] = entry['topk']
+    results['evaluation'] = {'ari_topk': evaluation_topk}
+
     if log_callback:
-        evaluation_topk = {}
-        for bucket_key, entry in best_per_bucket.items():
-            evaluation_topk[bucket_key] = entry['topk']
         log_callback(f'Best topk per bucket: {evaluation_topk}')
 
     return results
