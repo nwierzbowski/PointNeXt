@@ -79,6 +79,7 @@ def peeler_train(
     max_batches = cfg.get('validation', {}).get('max_batches')
     num_epochs = cfg.get('training', {}).get('num_epochs', 200)
     ari_topk = cfg.get('evaluation', {}).get('ari_topk', 1)
+    bucket_topk_map = ari_topk if isinstance(ari_topk, dict) else None
 
     return _train(
         model, train_loader, val_loader, optimizer, scheduler, device,
@@ -89,9 +90,10 @@ def peeler_train(
         num_epochs=num_epochs,
         report_interval=report_interval,
         best_metric=best_metric,
-        grad_accum_steps=grad_accum_steps,
-        max_batches=max_batches,
-        ari_topk=ari_topk,
+    grad_accum_steps=grad_accum_steps,
+    max_batches=max_batches,
+    ari_topk=ari_topk,
+    bucket_topk_map=bucket_topk_map,
         save_checkpoint_callback=_make_checkpoint_callback(),
         log_callback=log_callback,
         epoch_callback=epoch_callback,
@@ -133,6 +135,7 @@ def _train(
     max_batches=None,
     num_epochs=200,
     ari_topk=1,
+    bucket_topk_map=None,
 ):
     """Run the training epoch loop with cosine annealing LR schedule."""
     best_metric_value = float('inf') if best_metric not in ('ari',) else -1.0
@@ -235,24 +238,25 @@ def _train(
         # Validation every epoch
         val_loss = -1
         val_ari = 0.0
-        val_ari_thres = 0.0
         val_bucket_metrics = {}
         if val_loader is not None:
             val_results = validate(
-                model, val_loader, criterion, device, ari_topk=ari_topk
+                model, val_loader, criterion, device, ari_topk=ari_topk,
+                bucket_topk_map=bucket_topk_map
             )
             val_loss = val_results['avg_loss']
-            val_ari = val_results['best_ari']
-            val_ari_thres = val_results['best_ari_threshold']
             val_bucket_metrics = val_results.get('bucket_metrics', {})
+            if val_bucket_metrics:
+                val_ari = sum(bm['ari'] for bm in val_bucket_metrics.values()) / len(val_bucket_metrics)
 
         # Training set validation
         train_results = validate(
-            model, train_loader, criterion, device, max_batches=max_batches, ari_topk=ari_topk
+            model, train_loader, criterion, device, max_batches=max_batches,
+            ari_topk=ari_topk, bucket_topk_map=bucket_topk_map
         )
         train_loss = train_results['avg_loss']
-        train_ari = train_results['best_ari']
-        train_ari_thres = train_results['best_ari_threshold']
+        train_bucket_metrics = train_results.get('bucket_metrics', {})
+        train_ari = sum(bm['ari'] for bm in train_bucket_metrics.values()) / len(train_bucket_metrics) if train_bucket_metrics else 0.0
 
         if epoch_callback:
             lr = optimizer.param_groups[0]['lr']
@@ -270,12 +274,14 @@ def _train(
                 return entries
 
             val_buckets = format_bucket_metrics(val_bucket_metrics)
-            train_buckets = format_bucket_metrics(train_results.get('bucket_metrics', {}))
+            train_buckets = format_bucket_metrics(train_bucket_metrics)
 
             # Overall metrics line
+            val_bucket_count = len(val_bucket_metrics) if val_bucket_metrics else 0
+            train_bucket_count = len(train_bucket_metrics) if train_bucket_metrics else 0
             log_msg = f'Epoch {epoch}/{num_epochs} | LR: {lr:.2e} | Loss: {avg_loss:.4f}\n'
-            log_msg += f'  Val: Loss={val_loss:.3f} ARI={val_ari:.3f} (ARI@{val_ari_thres:.2f})\n'
-            log_msg += f'  Trn: Loss={train_loss:.3f} ARI={train_ari:.3f} (ARI@{train_ari_thres:.2f})'
+            log_msg += f'  Val: Loss={val_loss:.3f} ARI={val_ari:.3f} (avg across {val_bucket_count} buckets)\n'
+            log_msg += f'  Trn: Loss={train_loss:.3f} ARI={train_ari:.3f} (avg across {train_bucket_count} buckets)'
 
             # Bucket metrics - side by side val/train, one per line
             all_buckets = []
@@ -292,9 +298,9 @@ def _train(
                 for range_key, v_bm, t_bm in all_buckets:
                     parts = [f'    Frag {range_key:>7} (n={v_bm["count"] if v_bm else t_bm["count"]:>4}):']
                     if v_bm:
-                        parts.append(f'V ARI={v_bm["ari"]:.3f}')
+                        parts.append(f'V ARI={v_bm["ari"]:.3f}@{v_bm["threshold"]:.2f}')
                     if t_bm:
-                        parts.append(f'T ARI={t_bm["ari"]:.3f}')
+                        parts.append(f'T ARI={t_bm["ari"]:.3f}@{t_bm["threshold"]:.2f}')
                     log_msg += ' ' + '  '.join(parts) + '\n'
 
             epoch_callback(log_msg.rstrip())

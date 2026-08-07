@@ -1,7 +1,7 @@
 criterion:
   NAME: SparseFocalBCELoss
   alpha: 0.5
-  gamma: 2.0
+  gamma: 0.0
 dataset:
   asset_dropout_prob: 0.0
   asset_swap_prob: 0.0
@@ -9,7 +9,13 @@ dataset:
   max_fragments: 600
   seed: 42
 evaluation:
-  ari_topk: 16
+  ari_topk:
+    102-300: 12
+    12-26: 8
+    2-11: 6
+    27-51: 25
+    300+: 12
+    52-101: 6
 model:
   NAME: PurelyRelationalPeeler
   attn_dropout: 0.0
@@ -18,8 +24,12 @@ model:
   - 16
   - 16
   - 16
+  - 16
+  - 16
   highway_dim: 32
   mlp_sizes:
+  - 128
+  - 128
   - 128
   - 128
   - 128

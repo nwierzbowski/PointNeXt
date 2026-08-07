@@ -235,8 +235,13 @@ def _eval_single_sample_ari_sparse(probs_np, topk_local_np, gt_labels_np, thresh
 # 3. MAIN VALIDATION HARNESS
 # =============================================================================
 
-def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1):
-    """Run validation loop, sweeping thresholds to find best ARI via sparse single-linkage."""
+def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1, bucket_topk_map=None):
+    """Run validation loop, sweeping thresholds to find best ARI via sparse single-linkage.
+    
+    Args:
+        bucket_topk_map: Optional dict mapping bucket keys to topk values.
+                        If provided, uses per-bucket topk for ARI evaluation.
+    """
     model.eval()
     total_loss = 0.0
     total_scene_count = 0
@@ -290,14 +295,15 @@ def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1)
             indices_np = indices.cpu().numpy()
             mask_np = cand_mask.cpu().numpy()
 
-            for scene_idx in unique_scene_indices:
+            for batch_idx_local, scene_idx in enumerate(unique_scene_indices):
                 scene_idx_int = int(scene_idx.item())
                 idx_global_t = (scene_ids_t == scene_idx_int).nonzero(as_tuple=True)[0]
                 N_s = len(idx_global_t)
 
                 range_key = None
-                if soup_stats and scene_idx_int < len(soup_stats):
-                    actual_n = soup_stats[scene_idx_int].get('actual_n', 0)
+                # soup_stats is a list of dicts, one per sample in the batch
+                if soup_stats and batch_idx_local < len(soup_stats):
+                    actual_n = soup_stats[batch_idx_local].get('actual_n', 0)
                     range_key = _frag_to_range_key(actual_n)
 
                 logits_s = logits_np[idx_global_t.cpu().numpy()]
@@ -326,9 +332,10 @@ def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1)
                 if N_s <= 1:
                     continue
 
+                topk_eval = bucket_topk_map.get(range_key, ari_topk) if bucket_topk_map else ari_topk
                 b_ari = _eval_single_sample_ari_sparse(
                     probs_s_np, local_indices_np, scene_asset_ids_np,
-                    thresholds_np, topk_eval=ari_topk
+                    thresholds_np, topk_eval=topk_eval
                 )
 
                 track_bucket = range_key is not None and range_key in buckets
@@ -345,37 +352,36 @@ def validate(model, val_loader, criterion, device, max_batches=None, ari_topk=1)
                     buckets[range_key]['loss_sum'] += loss.item()
                     buckets[range_key]['sample_count'] += 1
 
-    # Finalize Global Metrics
+    # Finalize Per-Bucket Metrics
     avg_loss = total_loss / max(total_scene_count, 1)
 
-    best_ari = -1.0
-    best_ari_threshold = 0.5
-    if valid_sample_count_ari > 0:
-        avg_ari_per_t = ari_sums / valid_sample_count_ari
-        best_t_idx = np.argmax(avg_ari_per_t)
-        best_ari = float(avg_ari_per_t[best_t_idx])
-        best_ari_threshold = float(thresholds_np[best_t_idx])
-
     bucket_metrics = {}
+    bucket_ari_curves = {}
     for range_key, bucket in buckets.items():
         if bucket['sample_count'] == 0:
             continue
 
         b_loss = bucket['loss_sum'] / bucket['sample_count']
         b_best_ari = -1.0
+        b_best_threshold = 0.5
         if bucket['valid_sample_count_ari'] > 0:
             b_avg_ari = bucket['ari_sums'] / bucket['valid_sample_count_ari']
-            b_best_ari = float(np.max(b_avg_ari))
+            b_best_t_idx = np.argmax(b_avg_ari)
+            b_best_ari = float(b_avg_ari[b_best_t_idx])
+            b_best_threshold = float(thresholds_np[b_best_t_idx])
+            bucket_ari_curves[range_key] = b_avg_ari.tolist()
+        else:
+            bucket_ari_curves[range_key] = np.zeros(num_thresholds).tolist()
 
         bucket_metrics[range_key] = {
             'loss': round(b_loss, 4),
             'ari': round(b_best_ari, 4),
+            'threshold': round(b_best_threshold, 2),
             'count': bucket['sample_count'],
         }
 
     return {
         'avg_loss': round(avg_loss, 4),
-        'best_ari': round(best_ari, 4),
-        'best_ari_threshold': round(best_ari_threshold, 2),
+        'bucket_ari_curves': bucket_ari_curves,
         'bucket_metrics': bucket_metrics,
     }
