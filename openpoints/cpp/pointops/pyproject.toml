@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=59.5.0", "wheel", "torch", "numpy<2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pointops"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
